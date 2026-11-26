@@ -54,6 +54,10 @@ pub fn run(world: &mut World) {
             for y in cy * CHUNK..(cy + 1) * CHUNK {
                 for k in 0..CHUNK {
                     let x = cx * CHUNK + if flip { CHUNK - 1 - k } else { k };
+                    // Nothing crosses the faces of a wall.
+                    if world.derived.flags[y * w + x] & FIXED != 0 {
+                        continue;
+                    }
                     if x + 1 < w {
                         pair(world, &mut dirty, x, y, false, flux);
                     }
@@ -216,6 +220,8 @@ fn pair(world: &mut World, dirty: &mut Dirty, x: usize, y: usize, vertical: bool
             b.energy = 0.0;
         }
         dirty.add_pair(x, y, jx, jy);
+        world.chunks.stale[i] = 1;
+        world.chunks.stale[j] = 1;
     }
 }
 

@@ -12,7 +12,7 @@ Read these before changing anything:
 `cargo` is installed in `~/.cargo/bin` and may not be on PATH: `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 ```
-cargo test --release --workspace                 # 16 behaviour tests, about 6 s
+cargo test --release --workspace                 # 17 behaviour tests, about 7 s
 cargo run --release -p viewer                    # interactive viewer
 cargo run --release -p viewer                    # default scene is caves; --open for open air
 cargo run --release -p viewer -- --stress        # benchmark scene, every chunk busy
@@ -55,7 +55,7 @@ Step order in `World::step`: derive, heat, gas, grains, liquid. Inside the gas p
 - **Block, never destroy.** If a cell has no slot for a substance, the transfer is refused and the matter stays where it was. This applies to reactions and phase changes too.
 - **Empty slot invariant.** An unused slot has `id == 0`, `form == Form::None`, `amount == 0.0`. Sums over slots rely on this.
 - **Data, not code.** The engine never names a substance. Scenes and tests look substances up by symbol; passes only read table rows.
-- **Wake what you change.** Any change to a cell must call `Chunks::touch` (or go through `Dirty`), or the chunk may sleep with work left undone. A cell that is skipped but still has work pending must also touch.
+- **Mark and wake what you change.** Any change to what a cell holds must call `Chunks::touch` for that cell (or set `chunks.stale` and go through `Dirty`). `touch` does two jobs: it wakes the chunk, and it marks the cell so the derive pass recomputes it. A missed mark leaves the cell's derived values describing its old contents, silently. Energy-only changes are the exception: the heat pass updates the snapshot itself. Run new movement code under `Params::verify_derived` in a test. A cell that is skipped but still has work pending must also touch.
 - **Snapshot versus real state.** `world.derived` is computed once at the start of a step and goes stale as passes edit cells. Use it for cheap rejects and for picking partners; do the actual transfer on the real cells.
 
 ## Conventions

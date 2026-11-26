@@ -85,7 +85,24 @@ The guess that rock would make this cheap was wrong:
 - **A rock cell in an awake chunk is not free.** It is still derived (about 16 ns) and scanned by each pass. An awake chunk costs 0.21–0.25 ms whatever it holds, so the 16.7 ms budget is about 65–80 awake chunks, roughly one screen at zoom 2.
 - **Helium and hot bars never settle**, so their chambers stay awake for the whole run. Water and sand chambers do go to sleep.
 
-What would help here, cheapest first: make solid cells nearly free inside awake chunks (skip derive for cells that did not change; skip rows or runs of rock in the gas passes); smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk); multithreading.
+### After recomputing only changed cells (2026-11-26)
+
+| Scene | Size | Before | After |
+|---|---|---|---|
+| caves, after 1 min | 640×384 | 10.7 ms | 6.5 ms |
+| caves, after 1 min | 1024×512 | 26.4 ms | 17.5 ms |
+| playground, after 1 min | 640×384 | 22.3 ms | 19.7 ms |
+| playground, after 1 min | 1024×512 | 38.8 ms | 33.9 ms |
+
+The derive pass went from 7.1 ms to 1.8 ms in the 1024×512 cave scene. An awake chunk in the cave scene now costs about 0.17 ms, so the budget is about 100 awake chunks.
+
+What is left in that scene, per step: gas 10.6 ms (pressure relaxation 4.4, moving gas across faces 5.3, chunk summaries 0.9), heat 3.5, derive 1.8, liquid 1.0, grains 0.6. About 102 of 108 awake chunks have real pressure work every step, because half the chambers hold helium or a hot bar and many are linked by tunnels. This scene is busier than a normal moment in a game.
+
+Three further changes were tried on the gas pass and gained nothing measurable in this scene: keeping open-run lengths until the flags change (kept, it is sound), confining repeated local smoothing to a box around the pairs that moved a lot (kept), and not re-triggering relaxation while chunk pressure sums are unchanged (removed: no gain, and it could miss two compensating changes).
+
+What would help next, cheapest first: multithreading; a tighter inner loop for the face transfers and the adjacent-pair pass; smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk).
+
+Superseded list from before that work: make solid cells nearly free inside awake chunks (skip derive for cells that did not change; skip rows or runs of rock in the gas passes); smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk); multithreading.
 
 ## Known problems
 
@@ -113,6 +130,6 @@ Other:
 
 ## Tests
 
-`crates/sim/tests/physics.rs`, 16 tests: cell size, dry sand density, sleeping in still air, the sand-into-water worked example, sand pile and sleep, water levelling, mercury under water, sand in water versus on mercury, helium rising, heat flow, dry versus wet sand conductivity, full-cell blocking, pressure evening out within a second, a sealed box keeping its pressure, air beside hot iron staying near ambient, and conservation in a mixed scene (matter and energy to 2e-5 relative over 1500 steps).
+`crates/sim/tests/physics.rs`, 17 tests: cell size, dry sand density, sleeping in still air, the sand-into-water worked example, sand pile and sleep, water levelling, mercury under water, sand in water versus on mercury, helium rising, heat flow, dry versus wet sand conductivity, full-cell blocking, pressure evening out within a second, a sealed box keeping its pressure, air beside hot iron staying near ambient, kept derived values matching a full recompute in the cave scene, and conservation in a mixed scene (matter and energy to 2e-5 relative over 1500 steps).
 
 The feature builds `slots-6` and `slots-4` are only exercised by the benchmark; the tests have not been run with them.

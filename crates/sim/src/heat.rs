@@ -16,6 +16,9 @@ pub fn run(world: &mut World) {
     let geom = CELL_CM * 0.01 * DT * params.heat_speed;
     let tol = params.temp_tol;
 
+    // Per chunk: some heat flowed from one of its cells this step.
+    let mut flowed = vec![false; chunks.cw * chunks.ch];
+
     // First work out every flow from the start-of-step temperatures, so the
     // order faces are visited in does not matter. Then apply them.
     for cy in 0..chunks.ch {
@@ -60,6 +63,7 @@ pub fn run(world: &mut World) {
                     }
                 }
             }
+            flowed[cy * chunks.cw + cx] = !dirty.is_empty();
             dirty.flush(chunks);
         }
     }
@@ -71,9 +75,10 @@ pub fn run(world: &mut World) {
     // visited too.
     for cy in 0..chunks.ch {
         for cx in 0..chunks.cw {
-            let here = chunks.active[cy * chunks.cw + cx];
-            let left = cx > 0 && chunks.active[cy * chunks.cw + cx - 1];
-            let up = cy > 0 && chunks.active[(cy - 1) * chunks.cw + cx];
+            let c = cy * chunks.cw + cx;
+            let here = flowed[c];
+            let left = cx > 0 && flowed[c - 1];
+            let up = cy > 0 && flowed[c - chunks.cw];
             if !(here || left || up) {
                 continue;
             }

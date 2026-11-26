@@ -44,6 +44,9 @@ pub struct Params {
     pub max_speed: f32,
     /// Grain diameter in cm, for drag on falling grains.
     pub grain_cm: f32,
+    /// Debugging aid: after each derive pass, recompute every active cell
+    /// from scratch and panic if the kept values disagree. Slow; for tests.
+    pub verify_derived: bool,
 }
 
 impl Default for Params {
@@ -63,6 +66,7 @@ impl Default for Params {
             mix_tol: 1.0e-3,
             max_speed: 16.0,
             grain_cm: 0.1,
+            verify_derived: false,
         }
     }
 }
@@ -80,18 +84,24 @@ pub struct Chunks {
     pub active: Vec<bool>,
     /// Chunks to simulate next step.
     next: Vec<bool>,
+    /// Per cell: its contents changed since its derived values were last
+    /// worked out. Set by `touch`; cleared by the derive pass.
+    pub stale: Vec<u8>,
 }
 
 impl Chunks {
     fn new(w: usize, h: usize) -> Self {
         let (cw, ch) = (w / CHUNK, h / CHUNK);
-        Chunks { w, h, cw, ch, active: vec![false; cw * ch], next: vec![true; cw * ch] }
+        Chunks { w, h, cw, ch, active: vec![false; cw * ch], next: vec![true; cw * ch], stale: vec![1; w * h] }
     }
 
-    /// Record that the cell at (x, y) changed, waking its chunk and any
-    /// chunk it borders.
+    /// Record that the cell at (x, y) changed: mark it for the derive pass
+    /// and wake its chunk and any chunk it borders. Every change to what a
+    /// cell holds must end up here (or set `stale` itself), or the cell's
+    /// derived values go on describing what it used to hold.
     #[inline]
     pub fn touch(&mut self, x: usize, y: usize) {
+        self.stale[y * self.w + x] = 1;
         let (cx, cy) = (x / CHUNK, y / CHUNK);
         let (lx, ly) = (x % CHUNK, y % CHUNK);
         let x0 = if lx == 0 && cx > 0 { cx - 1 } else { cx };
@@ -151,6 +161,11 @@ impl Dirty {
         self.y0 = self.y0.min(y);
         self.x1 = self.x1.max(jx);
         self.y1 = self.y1.max(jy);
+    }
+
+    /// True if nothing has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.x0 > self.x1
     }
 
     /// Wake every chunk the box overlaps or borders, then reset. The box
@@ -216,7 +231,7 @@ impl World {
         World {
             cells: vec![ambient; w * h],
             chunks: Chunks::new(w, h),
-            derived: Derived::new(w * h),
+            derived: Derived::new(w * h, (w / CHUNK) * (h / CHUNK)),
             press: crate::pressure::Scratch::new(w * h, (w / CHUNK) * (h / CHUNK)),
             subs,
             params: Params::default(),
@@ -289,6 +304,9 @@ impl World {
 
         let t0 = Instant::now();
         crate::derive::run(self);
+        if self.params.verify_derived {
+            crate::derive::verify(self);
+        }
         let t1 = Instant::now();
         crate::heat::run(self);
         let t2 = Instant::now();

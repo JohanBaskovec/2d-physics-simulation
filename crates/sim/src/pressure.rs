@@ -77,6 +77,10 @@ pub struct Scratch {
     run_right: Vec<u8>,
     /// Number of open cells in a column starting here and going down.
     run_down: Vec<u8>,
+    /// Per chunk: the flags versions (own, right neighbour, lower
+    /// neighbour) the runs above were worked out from. Kept between steps,
+    /// so runs are only redone when walls or open space have moved.
+    run_key: Vec<[u64; 3]>,
     /// Per chunk: lowest and highest gas pressure, as of the last step the
     /// chunk was active. Kept between steps; a sleeping chunk's cells do
     /// not change, so its entry stays true.
@@ -100,6 +104,7 @@ impl Scratch {
             fy: vec![0.0; cells],
             run_right: vec![0; cells],
             run_down: vec![0; cells],
+            run_key: vec![[u64::MAX; 3]; chunks],
             p_min: vec![0.0; chunks],
             p_max: vec![0.0; chunks],
             rho_min: vec![0.0; chunks],
@@ -220,29 +225,39 @@ pub fn solve(world: &mut World) {
             let (x0, y0) = (cx * CHUNK, cy * CHUNK);
             let mut ops = 0usize;
 
-            // Lengths of open runs, read from this step's flags. The scan
-            // starts a chunk's width beyond the chunk so runs that continue
-            // into the next chunk are counted; anything further out is
-            // assumed closed, which can only make a run look shorter.
-            let x_end = (x0 + 2 * CHUNK).min(w);
-            for y in y0..y0 + CHUNK {
-                let mut run = 0u8;
-                for x in (x0..x_end).rev() {
-                    let i = y * w + x;
-                    run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
-                    if x < x0 + CHUNK {
-                        s.run_right[i] = run;
+            // Lengths of open runs, read from the flags. The scan starts a
+            // chunk's width beyond the chunk so runs that continue into the
+            // next chunk are counted; anything further out is assumed
+            // closed, which can only make a run look shorter. The flags of
+            // this chunk and of the ones to its right and below are all the
+            // runs depend on, so they are kept until one of those changes.
+            let key = [
+                d.flags_version[c],
+                right_of(cx, cy).map_or(0, |n| d.flags_version[n]),
+                below(cx, cy).map_or(0, |n| d.flags_version[n]),
+            ];
+            if s.run_key[c] != key {
+                s.run_key[c] = key;
+                let x_end = (x0 + 2 * CHUNK).min(w);
+                for y in y0..y0 + CHUNK {
+                    let mut run = 0u8;
+                    for x in (x0..x_end).rev() {
+                        let i = y * w + x;
+                        run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
+                        if x < x0 + CHUNK {
+                            s.run_right[i] = run;
+                        }
                     }
                 }
-            }
-            let y_end = (y0 + 2 * CHUNK).min(h);
-            let mut col = [0u8; CHUNK];
-            for y in (y0..y_end).rev() {
-                for (k, run) in col.iter_mut().enumerate() {
-                    let i = y * w + x0 + k;
-                    *run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
-                    if y < y0 + CHUNK {
-                        s.run_down[i] = *run;
+                let y_end = (y0 + 2 * CHUNK).min(h);
+                let mut col = [0u8; CHUNK];
+                for y in (y0..y_end).rev() {
+                    for (k, run) in col.iter_mut().enumerate() {
+                        let i = y * w + x0 + k;
+                        *run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
+                        if y < y0 + CHUNK {
+                            s.run_down[i] = *run;
+                        }
                     }
                 }
             }
@@ -305,10 +320,14 @@ pub fn solve(world: &mut World) {
             }
 
             // Adjacent pairs: every cell that is not a wall, open or not.
+            // The first pass covers the chunk. Repeats only cover the box
+            // around the pairs that moved a lot, since sharp differences
+            // are local (gas touching something hot, a burst).
+            let (mut bx0, mut by0, mut bx1, mut by1) = (x0, y0, x0 + CHUNK, y0 + CHUNK);
             for _ in 0..MAX_LOCAL_PASSES {
-                let mut worst = 0.0f32;
-                for y in y0..y0 + CHUNK {
-                    for x in x0..x0 + CHUNK {
+                let (mut nx0, mut ny0, mut nx1, mut ny1) = (usize::MAX, usize::MAX, 0, 0);
+                for y in by0..by1 {
+                    for x in bx0..bx1 {
                         let i = y * w + x;
                         let flags = d.flags[i];
                         if flags & FIXED != 0 {
@@ -327,15 +346,25 @@ pub fn solve(world: &mut World) {
                                 let f = if vertical { &mut s.fy } else { &mut s.fx };
                                 f[i] += delta;
                                 f[j] -= delta;
-                                worst = worst.max(delta.abs() / s.p[i].max(s.p[j]));
                                 ops += 1;
+                                if delta.abs() >= REPEAT_ABOVE * s.p[i].max(s.p[j]) {
+                                    nx0 = nx0.min(x);
+                                    ny0 = ny0.min(y);
+                                    nx1 = nx1.max(x);
+                                    ny1 = ny1.max(y);
+                                }
                             }
                         }
                     }
                 }
-                if worst < REPEAT_ABOVE {
+                if nx0 > nx1 {
                     break;
                 }
+                // Two cells of margin, kept inside this chunk.
+                bx0 = nx0.saturating_sub(2).max(x0);
+                by0 = ny0.saturating_sub(2).max(y0);
+                bx1 = (nx1 + 3).min(x0 + CHUNK);
+                by1 = (ny1 + 3).min(y0 + CHUNK);
             }
 
             // Nothing left to even out here: rest until the spread builds
