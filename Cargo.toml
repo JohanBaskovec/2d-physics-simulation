@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/sim", "crates/viewer"]
+
+[profile.release]
+opt-level = 3
+debug = 1
+
+# Keep debug builds of the simulation usable.
+[profile.dev]
+opt-level = 1

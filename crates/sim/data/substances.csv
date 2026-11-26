@@ -1,0 +1,20 @@
+# Substance table. One row per substance; the engine only ever reads rows.
+#
+# Units: molar_mass g/mol | rho_* g/cm3 | t_* K (at 1 atm) | cp_* J/(mol K)
+#        l_fus, l_vap J/mol | k_* W/(m K) | color RRGGBB
+#
+# STEP 1 PLACEHOLDER DATA: these few rows were typed from memory to exercise
+# the engine. They are close to handbook values but unverified, and several
+# (marked ~ in the notes below) are rough guesses. Step 2 replaces this file
+# with a sourced table for all 94 elements plus compounds.
+#   ~ cp_solid/k_solid of N2, O2, He; all He solid data (He has no solid at 1 atm)
+#   ~ SiO2 liquid/gas data and l_vap; k_liquid of Fe, Au; k_gas of all metals
+symbol,name,molar_mass,rho_solid,rho_liquid,t_melt,t_boil,cp_solid,cp_liquid,cp_gas,l_fus,l_vap,k_solid,k_liquid,k_gas,color
+N2,Nitrogen,28.014,1.026,0.807,63.15,77.36,46.0,57.2,29.12,720,5570,0.20,0.140,0.0258,283248
+O2,Oxygen,31.998,1.430,1.141,54.36,90.19,46.0,54.3,29.38,444,6820,0.20,0.150,0.0263,2c3a58
+He,Helium,4.0026,0.190,0.125,0.95,4.22,5.0,18.0,20.79,14,83,0.10,0.020,0.1513,e86fb0
+H2O,Water,18.015,0.917,0.997,273.15,373.15,37.7,75.3,36.0,6010,40650,2.20,0.600,0.0250,2f6fd6
+Hg,Mercury,200.59,14.18,13.534,234.32,629.88,28.3,27.98,20.79,2290,59110,30.0,8.30,0.0100,c8ccd4
+SiO2,Silica,60.084,2.648,2.20,1986,3220,44.4,86.0,50.0,9600,600000,3.00,2.00,0.0500,d8c07a
+Fe,Iron,55.845,7.874,6.98,1811,3134,25.10,46.0,25.7,13810,340000,80.4,35.0,0.0500,8a8f98
+Au,Gold,196.967,19.30,17.31,1337.33,3243,25.42,31.0,20.79,12550,342000,318.0,105.0,0.0500,f2c230
