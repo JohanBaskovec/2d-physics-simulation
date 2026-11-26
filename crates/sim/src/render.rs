@@ -4,6 +4,7 @@
 use crate::cell::Form;
 use crate::world::World;
 use crate::{ATM, SLOTS};
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -27,10 +28,14 @@ impl View {
 
 /// Fill `out` (RGBA, `vw * vh * 4` bytes) with the cells of the rectangle
 /// whose top-left corner is (x0, y0). Cells outside the world are black.
+/// Rows of pixels are independent, so they are drawn in parallel.
 pub fn draw(world: &World, view: View, x0: i32, y0: i32, vw: usize, vh: usize, out: &mut [u8]) {
     assert!(out.len() >= vw * vh * 4);
+    if vw == 0 {
+        return;
+    }
     let (w, h) = (world.width() as i32, world.height() as i32);
-    for py in 0..vh {
+    out[..vw * vh * 4].par_chunks_mut(vw * 4).enumerate().for_each(|(py, out)| {
         for px in 0..vw {
             let (x, y) = (x0 + px as i32, y0 + py as i32);
             let rgb = if x < 0 || y < 0 || x >= w || y >= h {
@@ -46,11 +51,11 @@ pub fn draw(world: &World, view: View, x0: i32, y0: i32, vw: usize, vh: usize, o
                     View::Pressure => pressure_ramp(c.pressure(&world.subs)),
                 }
             };
-            let o = (py * vw + px) * 4;
+            let o = px * 4;
             out[o..o + 3].copy_from_slice(&rgb);
             out[o + 3] = 255;
         }
-    }
+    });
 }
 
 fn material(world: &World, i: usize, x: u32, y: u32) -> [u8; 3] {

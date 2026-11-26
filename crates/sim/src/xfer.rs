@@ -349,3 +349,53 @@ pub fn move_fast(src: &mut Cell, dst: &mut Cell, s: usize, n: f32, t_src: f32, s
     dst.energy += e;
     true
 }
+
+/// Move a fraction of every gas in each cell to the other, for two cells
+/// that hold the same substances in the same slots: `fa` of `a`'s gas goes
+/// to `b` and `fb` of `b`'s gas goes to `a`, each carrying enthalpy at its
+/// source temperature (`ta`, `tb`, from the start-of-step snapshot).
+///
+/// This is [`move_fast`] for every slot at once. With the slots lined up
+/// there is nothing to search for and nothing can be blocked. Returns
+/// `None`, with nothing changed, when the cells are not laid out alike or
+/// when a slot would be left with less than a trace (it then has to be
+/// emptied and freed); the caller falls back to the general path. Otherwise
+/// returns whether anything moved.
+#[inline]
+pub fn trade_gas_aligned(a: &mut Cell, b: &mut Cell, fa: f32, fb: f32, ta: f32, tb: f32, subs: &Substances) -> Option<bool> {
+    // Same ids and forms in every slot. Folded into one number so the
+    // compiler compares the arrays whole.
+    let mut differ = 0u16;
+    for s in 0..SLOTS {
+        differ |= (a.id[s] ^ b.id[s]) | (a.form[s] as u8 ^ b.form[s] as u8) as u16;
+    }
+    if differ != 0 {
+        return None;
+    }
+    let (mut new_a, mut new_b) = (a.amount, b.amount);
+    // Net enthalpy going from `a` to `b`.
+    let mut e = 0.0f32;
+    let mut any = false;
+    for s in 0..SLOTS {
+        if a.form[s] != Form::Gas {
+            continue;
+        }
+        let (have_a, have_b) = (a.amount[s], b.amount[s]);
+        let (da, db) = (have_a * fa, have_b * fb);
+        if (da > 0.0 && have_a - da < TRACE_MOL) || (db > 0.0 && have_b - db < TRACE_MOL) {
+            return None;
+        }
+        let p = subs.props(a.id[s], Form::Gas);
+        e += da * (p.h0 + p.cp * ta) - db * (p.h0 + p.cp * tb);
+        new_a[s] = have_a - da + db;
+        new_b[s] = have_b - db + da;
+        any |= da > 0.0 || db > 0.0;
+    }
+    if any {
+        a.amount = new_a;
+        b.amount = new_b;
+        a.energy -= e;
+        b.energy += e;
+    }
+    Some(any)
+}

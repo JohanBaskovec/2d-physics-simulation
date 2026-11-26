@@ -45,6 +45,12 @@ pub struct Derived {
     /// chunk change. Lets other passes keep results that depend only on
     /// the flags (where the walls and the open gas are) until they move.
     pub flags_version: Vec<u64>,
+    /// Per chunk and row (`chunk * CHUNK + row`): the columns, as `[from,
+    /// to)` within the chunk, outside which every cell of that row is
+    /// [`FIXED`]. Most of an underground world is rock, and the gas passes
+    /// use this to step over it without looking at each cell. Cells inside
+    /// the range may still be fixed.
+    pub row_span: Vec<[u8; 2]>,
 }
 
 /// The cell is fixed in place (rigid volume above 50%).
@@ -70,6 +76,8 @@ impl Derived {
             fill: vec![0.0; n],
             flags: vec![0; n],
             flags_version: vec![0; chunks],
+            // The whole row until worked out: always safe.
+            row_span: vec![[0, CHUNK as u8]; chunks * CHUNK],
         }
     }
 }
@@ -122,6 +130,7 @@ pub fn run(world: &mut World) {
         let mut flags = d.flags.chunks_mut(band);
         let mut stale = chunks.stale.chunks_mut(band);
         let mut version = d.flags_version.chunks_mut(cw);
+        let mut span = d.row_span.chunks_mut(cw * CHUNK);
         for _ in 0..chunks.ch {
             bands.push(Band {
                 temp: temp.next().expect("band"),
@@ -135,6 +144,7 @@ pub fn run(world: &mut World) {
                 flags: flags.next().expect("band"),
                 stale: stale.next().expect("band"),
                 version: version.next().expect("band"),
+                span: span.next().expect("band"),
             });
         }
     }
@@ -176,6 +186,10 @@ pub fn run(world: &mut World) {
             }
             if flags_changed {
                 b.version[cx] += 1;
+                for ly in 0..CHUNK {
+                    let row = ly * w + cx * CHUNK;
+                    b.span[cx * CHUNK + ly] = span_of(&b.flags[row..row + CHUNK]);
+                }
             }
         }
     });
@@ -194,6 +208,18 @@ struct Band<'a> {
     flags: &'a mut [u8],
     stale: &'a mut [u8],
     version: &'a mut [u64],
+    span: &'a mut [[u8; 2]],
+}
+
+/// The range of columns in one chunk row outside which every cell is fixed.
+fn span_of(flags: &[u8]) -> [u8; 2] {
+    match flags.iter().position(|f| f & FIXED == 0) {
+        None => [0, 0],
+        Some(first) => {
+            let last = flags.iter().rposition(|f| f & FIXED == 0).expect("found one from the front");
+            [first as u8, last as u8 + 1]
+        }
+    }
 }
 
 /// Recompute every cell of every active chunk and panic if a kept value
@@ -208,8 +234,11 @@ pub fn verify(world: &World) {
                 continue;
             }
             for y in cy * CHUNK..(cy + 1) * CHUNK {
+                let [from, to] = d.row_span[(cy * chunks.cw + cx) * CHUNK + y % CHUNK];
                 for x in cx * CHUNK..(cx + 1) * CHUNK {
                     let i = y * w + x;
+                    let inside = (from as usize..to as usize).contains(&(x % CHUNK));
+                    assert!(inside || d.flags[i] & FIXED != 0, "cell ({x}, {y}) is not fixed but lies outside its row's span {from}..{to}");
                     let v = compute(&cells[i], subs);
                     // Temperature and what follows from it are carried
                     // forward by addition, so allow for rounding. The rest

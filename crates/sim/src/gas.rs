@@ -18,28 +18,38 @@ use crate::derive::{Derived, FIXED, OPEN, POWDER};
 use crate::substance::Substances;
 use crate::world::{Dirty, Off, Params, World};
 use rayon::prelude::*;
-use crate::xfer::{exchange_gas, move_fast, Pair};
+use crate::xfer::{exchange_gas, move_fast, trade_gas_aligned, Pair};
 use crate::{CHUNK, SLOTS};
+use std::time::Instant;
 
 /// Each pair of neighbours diffuses once every this many steps, with the
 /// rate scaled up to match. Diffusion is slow, so doing it in turns costs
 /// no accuracy and saves most of the work in gas that is merely mixing.
 const DIFFUSE_EVERY: usize = 8;
 
+/// Rows per task when moving gas across faces. Much smaller than a chunk so
+/// that there are several times more tasks than threads and a busy part of
+/// the world is shared out between them. Must divide [`CHUNK`].
+const STRIP: usize = 16;
+
 pub fn run(world: &mut World) {
+    let t0 = Instant::now();
     crate::pressure::summarise(world);
+    let t1 = Instant::now();
     // Buoyancy goes first because it relocates whole parcels of gas. The
     // pressure pass must see where each parcel ends up, or it would ask a
     // cell to expel gas on behalf of a hot parcel that has since left it.
     overturn(world);
+    let t2 = Instant::now();
     crate::pressure::solve(world);
-
+    let t3 = Instant::now();
     faces(world);
+    world.stats.gas_parts = [t1 - t0, t2 - t1, t3 - t2, t3.elapsed()];
 }
 
-/// Everything one task needs to move gas across the faces of one row of
-/// chunks. `cells` and `stale` cover that row and the one below it (a face
-/// on the bottom edge reaches one cell into the next row); the rest is
+/// Everything one task needs to move gas across the faces of one strip of
+/// rows. `cells` and `stale` cover that strip and the one below it (a face
+/// on the bottom edge reaches one cell into the next strip); the rest is
 /// shared and read-only.
 struct Faces<'a> {
     cells: Off<'a, Cell>,
@@ -56,18 +66,18 @@ struct Faces<'a> {
 /// Move gas across every cell face that has a pressure flux or gas still
 /// mixing.
 ///
-/// Rows of chunks are handled in parallel, in two rounds: even rows, then
-/// odd rows. A task changes cells in its own row and the top line of the
-/// row below, so two tasks in the same round are always a whole row apart
-/// and can never touch the same cell. The result does not depend on how
-/// many threads there are.
+/// The world is cut into strips of [`STRIP`] rows, handled in parallel in
+/// two rounds: even strips, then odd strips. A task changes cells in its
+/// own strip and the top line of the strip below, so two tasks in the same
+/// round are always a whole strip apart and can never touch the same cell.
+/// The result does not depend on how many threads there are.
 fn faces(world: &mut World) {
     let World { cells, chunks, derived, press, params, subs, .. } = world;
     let (w, h, cw, ch) = (chunks.w, chunks.h, chunks.cw, chunks.ch);
     let step = world.step_count;
     // Alternate sweep direction so no side is favoured.
     let flip = step & 1 == 1;
-    let band = w * CHUNK;
+    let band = w * STRIP;
     // A copy, because waking chunks between the rounds changes the list.
     let active: Vec<bool> = chunks.active.clone();
     let press: &crate::pressure::Scratch = press;
@@ -83,8 +93,9 @@ fn faces(world: &mut World) {
             .zip(chunks.stale[round * band..].par_chunks_mut(2 * band))
             .enumerate()
             .map(|(k, (cells, stale))| {
-                let cy = round + 2 * k;
-                let base = cy * band;
+                let strip = round + 2 * k;
+                let base = strip * band;
+                let cy = strip * STRIP / CHUNK;
                 let mut v = Faces {
                     cells: Off { s: cells, base },
                     stale: Off { s: stale, base },
@@ -111,9 +122,11 @@ fn faces(world: &mut World) {
                     if !flux && press.density_uniform(c, right, down, params.mix_tol) {
                         continue;
                     }
-                    for y in cy * CHUNK..(cy + 1) * CHUNK {
-                        for k in 0..CHUNK {
-                            let x = cx * CHUNK + if flip { CHUNK - 1 - k } else { k };
+                    for y in strip * STRIP..(strip + 1) * STRIP {
+                        // Outside this range the row is all wall.
+                        let [from, to] = derived.row_span[c * CHUNK + y % CHUNK];
+                        for k in from as usize..to as usize {
+                            let x = cx * CHUNK + if flip { from as usize + to as usize - 1 - k } else { k };
                             // Nothing crosses the faces of a wall.
                             if derived.flags[y * w + x] & FIXED != 0 {
                                 continue;
@@ -257,36 +270,44 @@ fn pair(v: &mut Faces, dirty: &mut Dirty, x: usize, y: usize, vertical: bool, ha
     let subs = v.subs;
     // Amounts are read before anything moves, so gas that arrives in this
     // exchange is not sent straight back.
-    let mut gas_a = [0.0f32; SLOTS];
-    let mut gas_b = [0.0f32; SLOTS];
-    for s in 0..SLOTS {
-        if a.form[s] == Form::Gas {
-            gas_a[s] = a.amount[s] * fa;
+    // Air next to air: both cells hold the same things in the same slots,
+    // and the whole exchange is a few multiplications.
+    let moved = match trade_gas_aligned(a, b, fa, fb, ta, tb, subs) {
+        Some(moved) => moved,
+        None => {
+            let mut gas_a = [0.0f32; SLOTS];
+            let mut gas_b = [0.0f32; SLOTS];
+            for s in 0..SLOTS {
+                if a.form[s] == Form::Gas {
+                    gas_a[s] = a.amount[s] * fa;
+                }
+                if b.form[s] == Form::Gas {
+                    gas_b[s] = b.amount[s] * fb;
+                }
+            }
+            let mut moved = false;
+            for s in 0..SLOTS {
+                if gas_a[s] > 0.0 {
+                    moved |= move_fast(a, b, s, gas_a[s], ta, subs);
+                }
+            }
+            for s in 0..SLOTS {
+                if gas_b[s] > 0.0 {
+                    moved |= move_fast(b, a, s, gas_b[s], tb, subs);
+                }
+            }
+            // A cell with no matter cannot hold energy.
+            if a.is_empty() {
+                b.energy += a.energy;
+                a.energy = 0.0;
+            } else if b.is_empty() {
+                a.energy += b.energy;
+                b.energy = 0.0;
+            }
+            moved
         }
-        if b.form[s] == Form::Gas {
-            gas_b[s] = b.amount[s] * fb;
-        }
-    }
-    let mut moved = false;
-    for s in 0..SLOTS {
-        if gas_a[s] > 0.0 {
-            moved |= move_fast(a, b, s, gas_a[s], ta, subs);
-        }
-    }
-    for s in 0..SLOTS {
-        if gas_b[s] > 0.0 {
-            moved |= move_fast(b, a, s, gas_b[s], tb, subs);
-        }
-    }
+    };
     if moved {
-        // A cell with no matter cannot hold energy.
-        if a.is_empty() {
-            b.energy += a.energy;
-            a.energy = 0.0;
-        } else if b.is_empty() {
-            a.energy += b.energy;
-            b.energy = 0.0;
-        }
         dirty.add_pair(x, y, jx, jy);
         v.stale[i] = 1;
         v.stale[j] = 1;

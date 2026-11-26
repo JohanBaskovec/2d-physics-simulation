@@ -77,8 +77,9 @@ fn main() {
     let filter = std::env::args().nth(1).unwrap_or_default();
     let wanted = |name: &str| name.contains(&filter);
     println!(
-        "slots per cell: {SLOTS}   cell size: {} bytes   single thread",
-        std::mem::size_of::<Cell>()
+        "slots per cell: {SLOTS}   cell size: {} bytes   threads: {} (set RAYON_NUM_THREADS to change)",
+        std::mem::size_of::<Cell>(),
+        rayon::current_num_threads()
     );
     for (w, h) in [(640, 384), (1024, 512)] {
         println!("\n{w} x {h} cells ({:.1} MB of cells)", (w * h * std::mem::size_of::<Cell>()) as f64 / 1e6);

@@ -410,3 +410,70 @@ fn kept_derived_values_match_a_full_recompute() {
         w.step();
     }
 }
+
+/// The quick gas exchange for two cells laid out alike must do exactly what
+/// the general slot-by-slot path does.
+#[test]
+fn aligned_gas_trade_matches_the_general_path() {
+    use sim::xfer::{move_fast, trade_gas_aligned};
+    let w = world(64, 64);
+    let subs = &w.subs;
+    let (ta, tb) = (400.0, 300.0);
+    let a0 = Cell::gas(subs, &air(subs), ta, 1.5 * AMBIENT_P);
+    let b0 = Cell::gas(subs, &air(subs), tb, AMBIENT_P);
+    let (fa, fb) = (0.03, 0.01);
+
+    let (mut a, mut b) = (a0, b0);
+    assert_eq!(trade_gas_aligned(&mut a, &mut b, fa, fb, ta, tb, subs), Some(true));
+
+    let (mut c, mut d) = (a0, b0);
+    for s in 0..SLOTS {
+        if a0.form[s] == Form::Gas {
+            assert!(move_fast(&mut c, &mut d, s, a0.amount[s] * fa, ta, subs));
+        }
+    }
+    for s in 0..SLOTS {
+        if b0.form[s] == Form::Gas {
+            assert!(move_fast(&mut d, &mut c, s, b0.amount[s] * fb, tb, subs));
+        }
+    }
+    for s in 0..SLOTS {
+        assert_close(a.amount[s] as f64, c.amount[s] as f64, 1e-6, "amount left in a");
+        assert_close(b.amount[s] as f64, d.amount[s] as f64, 1e-6, "amount left in b");
+    }
+    assert_close(a.energy as f64, c.energy as f64, 1e-6, "energy of a");
+    assert_close(b.energy as f64, d.energy as f64, 1e-6, "energy of b");
+    // Nothing created or lost.
+    assert_close((a.energy + b.energy) as f64, (a0.energy + b0.energy) as f64, 1e-6, "total energy");
+
+    // Cells that are not laid out alike are left for the general path.
+    let helium = Cell::gas(subs, &[(subs.must("He"), 1.0)], tb, AMBIENT_P);
+    let (mut a, mut h) = (a0, helium);
+    assert_eq!(trade_gas_aligned(&mut a, &mut h, fa, fb, ta, tb, subs), None);
+    assert_eq!(a.amount, a0.amount);
+}
+
+/// The parallel passes must give the same world whatever the number of
+/// threads, down to the last bit.
+#[test]
+fn result_does_not_depend_on_thread_count() {
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("thread pool");
+        let mut w = world(256, 256);
+        sim::scene::caves(&mut w);
+        pool.install(|| {
+            for _ in 0..200 {
+                w.step();
+            }
+        });
+        w
+    };
+    let (one, many) = (run(1), run(5));
+    for (i, (a, b)) in one.cells.iter().zip(&many.cells).enumerate() {
+        let same = a.amount.map(f32::to_bits) == b.amount.map(f32::to_bits)
+            && a.energy.to_bits() == b.energy.to_bits()
+            && a.id == b.id
+            && a.form == b.form;
+        assert!(same, "cell {i} differs between 1 and 5 threads:\n{a:?}\n{b:?}");
+    }
+}

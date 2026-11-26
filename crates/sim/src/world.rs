@@ -261,6 +261,9 @@ pub struct StepStats {
     pub gas: Duration,
     pub grains: Duration,
     pub liquid: Duration,
+    /// Parts of `gas`: chunk summaries, buoyancy, pressure relaxation, and
+    /// moving gas across faces.
+    pub gas_parts: [Duration; 4],
 }
 
 impl StepStats {
@@ -363,6 +366,15 @@ impl World {
 
     /// Advance the simulation by one time step.
     pub fn step(&mut self) {
+        // Nothing is awake, so no pass has anything to do. Return before
+        // waking the worker threads: a world at rest should cost nothing.
+        if !self.chunks.any_pending() {
+            self.chunks.advance();
+            self.press.rest();
+            self.stats = StepStats::default();
+            self.step_count += 1;
+            return;
+        }
         // Run the whole step on one of the worker threads. If the caller's
         // thread ran it, that thread would be put to sleep at every parallel
         // section and woken after it, and on a laptop a core that has just

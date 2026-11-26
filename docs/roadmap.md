@@ -11,11 +11,11 @@ Last updated 2026-11-26.
 | 3 | Gas pressure done properly; liquid pressure at depth | Gas pressure done 2026-11-26, at a performance cost (see below). Liquid pressure not started. |
 | 4 | Walls and digging; unsupported walls collapsing | Not started |
 | 5 | Compounds, reactions, dissolving | Not started |
-| 6 | Multithreading; larger or streaming worlds | First stage done 2026-11-26 with little gain; see "Multithreading, first stage" |
+| 6 | Multithreading; larger or streaming worlds | Most passes parallel as of 2026-11-26; see "Performance work, second round". Buoyancy, powders and liquids are still serial. |
 
 The user chose to do gas pressure (step 3) before phase changes (step 2).
 
-**Open decision:** what to do about performance, which got worse with correct gas pressure. Options are under "Performance after gas pressure" below.
+Performance got worse with correct gas pressure and has since been brought back under budget for the cave scene; the history is below, newest last. Current numbers are under "Performance work, second round".
 
 ## Benchmark results, step 1
 
@@ -113,24 +113,74 @@ Uses rayon. Parallel over rows of chunks ("bands"): derive, heat, the gas chunk 
 
 By thread count at 1024×512 (`examples/threads.rs`, same session, single-threaded build 18.8 ms): 1 thread 20.6 ms, 2 threads 18.0, 4 threads 17.6, 8 threads 16.7.
 
-Findings:
+Findings at the time:
 
-- **The passes do not scale with cores.** Derive goes 2.07 to 1.19 ms and heat 4.24 to 2.07 ms from 1 to 8 threads; gas barely moves (12.3 to 10.8 ms) even though its face transfers, about half of it, are parallel.
-- **Most likely cause: memory, not arithmetic.** Each pass streams over several whole-world arrays (about 40 MB of derived and scratch data at 1024×512, against 8 MB of cache), and there are around eight such sweeps per step. Cores share one memory bus. This also explains why three earlier attempts to trim arithmetic in the gas pass gained nothing. Not yet proven with a hardware counter.
-- **The smaller world got slower**, because it fits in cache better, so thread overhead and the heat pass's doubled arithmetic (each face is now evaluated from both sides so cells can be written independently) are not paid back.
+- **The passes did not scale with cores.** Derive went 2.07 to 1.19 ms and heat 4.24 to 2.07 ms from 1 to 8 threads; gas barely moved (12.3 to 10.8 ms).
 - **The step must run on a worker thread** (`rayon::scope` in `World::step`). Run from the caller's thread, every parallel section put that thread to sleep, and the serial passes after it ran at half speed on this laptop.
+- **Wrong diagnosis, corrected below.** This section first blamed memory traffic (40 MB of arrays against 8 MB of cache) and proposed cache blocking. That was a guess; the counters say otherwise.
 
-What this points to next: keep a chunk's data in cache while doing all the gas work on it (process chunk by chunk through summaries, relaxation and transfers, instead of pass by pass over the world), and shrink what is streamed (pack the derived values per cell, drop arrays that can be recomputed). Parallelising the remaining serial passes should come after that, since it would hit the same wall.
+The user chose to keep this stage (committed 2026-11-26).
 
-The user chose to keep this stage (committed 2026-11-26) and continue with the memory work.
+### Performance work, second round (2026-11-26)
 
-Superseded list from before that work: make solid cells nearly free inside awake chunks (skip derive for cells that did not change; skip rows or runs of rock in the gas passes); smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk); multithreading.
+Measured with `perf stat` before changing anything:
+
+| Run | Clock | Instructions per cycle |
+|---|---|---|
+| 1 thread | 4.16 GHz | 2.85 |
+| 8 separate single-threaded copies at once | 3.37 GHz each | 2.2 each |
+| 8 threads, first-stage build | 2.19 GHz average, 2.4 cores in use | 2.82 |
+
+- **The step is limited by arithmetic, not memory.** 2.85 instructions per cycle and 2% first-level cache misses is a processor that is busy, not waiting. The step executed 225 million instructions.
+- **Threads gained little for two other reasons.** Half the step was still serial, and helper cores that sit idle between short parallel sections run at a low clock (and take up to 0.4 ms to wake). Eight fully busy cores on this laptop are worth about five single cores.
+- **Two threads give almost everything eight do**, and on the small world two are faster than eight. Not understood beyond the point above; the thread count is left at rayon's default.
+
+What was changed, each measured:
+
+| Change | Effect on the 1024×512 cave scene, 1 thread |
+|---|---|
+| Heat: each face worked out once, in loops with no branches, which the compiler vectorises | heat 3.9 to 1.5 ms |
+| Gas passes skip rock, using a per-row range of non-wall cells (`Derived::row_span`) | pressure 4.3 to 2.6 ms, summaries 0.95 to 0.5 ms |
+| Gas exchange between two cells laid out alike (air next to air, 91% of exchanges) done in one short loop (`xfer::trade_gas_aligned`) | faces 5.6 to 4.2 ms |
+| Pressure relaxation in parallel, two alternating rounds of chunk rows | pressure 2.6 to 1.9 ms at 8 threads |
+| Face transfers in strips of 16 rows instead of whole chunk rows | faces 3.3 to 2.2 ms at 8 threads |
+| A step with nothing awake returns at once | still air back to 0.00 ms |
+| Renderer draws pixel rows in parallel | one 640×360 view 4.5 to 0.9 ms |
+
+Old and new builds run back to back (`examples/threads.rs`, cave scene after 200 steps):
+
+| Size | Before, 1 thread | Before, 8 threads | After, 1 thread | After, 2 threads | After, 8 threads |
+|---|---|---|---|---|---|
+| 640×384 | 7.6 ms | 7.1 ms | 5.2 ms | 4.0 ms | 4.8 ms |
+| 1024×512 | 19.1 ms | 15.3 ms | 14.2 ms | 9.4 ms | 9.1 ms |
+
+Benchmark (`bench`, 8 threads, after 1 min):
+
+| Scene | Size | Mean | p99 | Before this round |
+|---|---|---|---|---|
+| caves | 640×384 | 3.7 ms | 4.8 ms | 7.5 ms |
+| caves | 1024×512 | 8.6 ms | 12.6 ms | 15.4 ms |
+| playground | 640×384 | 8.9 ms | 14.1 ms | 19.7 ms (single-threaded build) |
+| playground | 1024×512 | 14.9 ms | 18.7 ms | 33.9 ms (single-threaded build) |
+
+The cave scene now fits the 16.7 ms budget at 1024×512 with room to spare. The open-air playground fits on average at that size but its slowest steps do not.
+
+What is left, 1024×512 caves at 8 threads: gas 5.2 ms (faces 2.2, pressure 1.9, buoyancy 0.9, summaries 0.2), liquid 1.3, derive 0.95, grains 0.9, heat 0.8.
+
+Not verified: frame rate in the viewer after these changes. One screenshot run before the renderer change showed 50 fps with an 11.5 ms step (the step is slower there than in the benchmark because cores idle between frames). Later runs stalled because the window was hidden.
+
+What would help next:
+
+- **Parallelise buoyancy, powders and liquids.** They are serial, about 3 ms together, and run slower when other cores have just been busy. Buoyancy needs a random number stream per chunk to stay independent of thread count.
+- **Trim the face transfer further.** It still executes about 500 instructions per exchange.
+- **Cells that are not laid out alike** (helium mixing into air) take the slow exchange path. Keeping slots in a fixed order per substance would make every exchange the quick kind.
+- **AVX2.** Building with `-C target-cpu=x86-64-v3` gained about 4% overall (heat 1.6 to 1.25 ms). Not adopted; it restricts which processors the program runs on.
 
 ## Known problems
 
 Gas:
 
-- Performance, as above.
+- Performance: see "Performance work, second round". Buoyancy, powders and liquids are still single-threaded.
 - Gas has no velocity: no wind that keeps blowing, no flow around obstacles. Light gas rises only within its own column. In the helium test about two thirds reaches the top band; the rest is left as a trail that then only diffuses.
 - Pressure has a dead band of about 0.2% per pair, up to about 2% across a large region, and single cells touching something very hot can be about 4% off for a step.
 - Compression does not heat gas and expansion does not cool it.
@@ -152,6 +202,6 @@ Other:
 
 ## Tests
 
-`crates/sim/tests/physics.rs`, 17 tests: cell size, dry sand density, sleeping in still air, the sand-into-water worked example, sand pile and sleep, water levelling, mercury under water, sand in water versus on mercury, helium rising, heat flow, dry versus wet sand conductivity, full-cell blocking, pressure evening out within a second, a sealed box keeping its pressure, air beside hot iron staying near ambient, kept derived values matching a full recompute in the cave scene, and conservation in a mixed scene (matter and energy to 2e-5 relative over 1500 steps).
+`crates/sim/tests/physics.rs`, 19 tests: cell size, dry sand density, sleeping in still air, the sand-into-water worked example, sand pile and sleep, water levelling, mercury under water, sand in water versus on mercury, helium rising, heat flow, dry versus wet sand conductivity, full-cell blocking, pressure evening out within a second, a sealed box keeping its pressure, air beside hot iron staying near ambient, kept derived values matching a full recompute in the cave scene, the quick gas exchange matching the general one, results identical for 1 and 5 threads, and conservation in a mixed scene (matter and energy to 2e-5 relative over 1500 steps).
 
 The feature builds `slots-6` and `slots-4` are only exercised by the benchmark; the tests have not been run with them.

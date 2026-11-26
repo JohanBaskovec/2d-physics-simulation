@@ -27,8 +27,8 @@
 //! costs almost nothing. The price is a dead band: pressure differences up
 //! to about `rel_tol` (0.2%) are left standing.
 
-use crate::derive::{FIXED, OPEN, POWDER};
-use crate::world::World;
+use crate::derive::{Derived, FIXED, OPEN, POWDER};
+use crate::world::{Off, World};
 use rayon::prelude::*;
 use crate::{CHUNK, EPS_VOL};
 
@@ -82,6 +82,12 @@ pub struct Scratch {
     /// neighbour) the runs above were worked out from. Kept between steps,
     /// so runs are only redone when walls or open space have moved.
     run_key: Vec<[u64; 3]>,
+    /// Per chunk: the longest run in `run_right` and in `run_down`, so a
+    /// chunk with no run long enough for this step's distance is skipped.
+    run_max: Vec<[u8; 2]>,
+    /// Per chunk: the flags version at which `fx` and `fy` were last
+    /// cleared from edge to edge. See the note on clearing in `solve`.
+    zero_key: Vec<u64>,
     /// Per chunk: lowest and highest gas pressure, as of the last step the
     /// chunk was active. Kept between steps; a sleeping chunk's cells do
     /// not change, so its entry stays true.
@@ -106,6 +112,8 @@ impl Scratch {
             run_right: vec![0; cells],
             run_down: vec![0; cells],
             run_key: vec![[u64::MAX; 3]; chunks],
+            run_max: vec![[0; 2]; chunks],
+            zero_key: vec![u64::MAX; chunks],
             p_min: vec![0.0; chunks],
             p_max: vec![0.0; chunks],
             rho_min: vec![0.0; chunks],
@@ -113,6 +121,11 @@ impl Scratch {
             relaxing: vec![false; chunks],
             has_flux: vec![false; chunks],
         }
+    }
+
+    /// No chunk is awake: none is in the middle of relaxing either.
+    pub fn rest(&mut self) {
+        self.relaxing.fill(false);
     }
 
     /// True if gas density is the same, to within `tol`, throughout chunk
@@ -148,9 +161,11 @@ pub fn summarise(world: &mut World) {
                 }
                 let (mut p_lo, mut p_hi) = (f32::MAX, f32::MIN);
                 let (mut r_lo, mut r_hi) = (f32::MAX, f32::MIN);
-                for y in cy * CHUNK..(cy + 1) * CHUNK {
-                    let row = y * w + cx * CHUNK;
-                    for i in row..row + CHUNK {
+                for ly in 0..CHUNK {
+                    // Outside this range the row is all wall.
+                    let [from, to] = d.row_span[(cy * cw + cx) * CHUNK + ly];
+                    let row = (cy * CHUNK + ly) * w + cx * CHUNK;
+                    for i in row + from as usize..row + to as usize {
                         // Cells with no room for gas have no gas pressure.
                         if d.gas_vol[i] > EPS_VOL && d.flags[i] & FIXED == 0 {
                             p_lo = p_lo.min(d.pressure[i]);
@@ -172,10 +187,37 @@ pub fn summarise(world: &mut World) {
         });
 }
 
+/// What one task needs to relax the chunks of one row of chunks. The
+/// per-cell arrays cover that row and the one below it, because a pair can
+/// end in the next chunk down; the per-chunk arrays likewise.
+struct Relax<'a> {
+    p: Off<'a, f32>,
+    fx: Off<'a, f32>,
+    fy: Off<'a, f32>,
+    run_right: Off<'a, u8>,
+    run_down: Off<'a, u8>,
+    run_key: Off<'a, [u64; 3]>,
+    run_max: Off<'a, [u8; 2]>,
+    relaxing: Off<'a, bool>,
+    d: &'a Derived,
+    active: &'a [bool],
+    /// Distance of this step's long pairs.
+    long: usize,
+    tol: f32,
+    pore_gas_flow: f32,
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+}
+
 pub fn solve(world: &mut World) {
     let long = LONG[world.step_count as usize % LONG.len()];
     let World { chunks, derived: d, press: s, params, .. } = world;
     let (w, h, cw, ch) = (chunks.w, chunks.h, chunks.cw, chunks.ch);
+    let d: &Derived = d;
+    let active: &[bool] = &chunks.active;
+    let band = w * CHUNK;
     let right_of = |cx: usize, cy: usize| (cx + 1 < cw).then(|| cy * cw + cx + 1);
     let below = |cx: usize, cy: usize| (cy + 1 < ch).then(|| (cy + 1) * cw + cx);
 
@@ -186,7 +228,7 @@ pub fn solve(world: &mut World) {
     for cy in 0..ch {
         for cx in 0..cw {
             let c = cy * cw + cx;
-            if !chunks.active[c] {
+            if !active[c] {
                 s.relaxing[c] = false;
                 continue;
             }
@@ -209,209 +251,318 @@ pub fn solve(world: &mut World) {
             }
         }
     }
-    for cy in 0..ch {
-        for cx in 0..cw {
-            if !s.has_flux[cy * cw + cx] {
-                continue;
-            }
-            for y in cy * CHUNK..(cy + 1) * CHUNK {
-                let row = y * w + cx * CHUNK;
-                s.p[row..row + CHUNK].copy_from_slice(&d.pressure[row..row + CHUNK]);
-                s.fx[row..row + CHUNK].fill(0.0);
-                s.fy[row..row + CHUNK].fill(0.0);
-            }
-        }
-    }
+    let Scratch { p, fx, fy, run_right, run_down, run_key, run_max, zero_key, relaxing, has_flux, .. } = s;
+    let has_flux: &[bool] = has_flux;
 
+    // Start from this step's pressures and no flux. Only the part of each
+    // row that is not wall is used, so only that part is prepared. That
+    // relies on the flux of a wall cell being zero already (the running
+    // sums read the cell to the left and the cell above without asking what
+    // they are): nothing ever writes flux into a wall, and when the walls
+    // in a chunk have moved, the whole chunk is cleared once.
+    p.par_chunks_mut(band)
+        .zip(fx.par_chunks_mut(band))
+        .zip(fy.par_chunks_mut(band))
+        .zip(zero_key.par_chunks_mut(cw))
+        .enumerate()
+        .for_each(|(cy, (((p, fx), fy), zero_key))| {
+            for cx in 0..cw {
+                let c = cy * cw + cx;
+                if !has_flux[c] {
+                    continue;
+                }
+                let whole = zero_key[cx] != d.flags_version[c];
+                zero_key[cx] = d.flags_version[c];
+                for ly in 0..CHUNK {
+                    let [from, to] = if whole { [0, CHUNK as u8] } else { d.row_span[c * CHUNK + ly] };
+                    let row = ly * w + cx * CHUNK;
+                    let (a, b) = (row + from as usize, row + to as usize);
+                    p[a..b].copy_from_slice(&d.pressure[cy * band + a..cy * band + b]);
+                    fx[a..b].fill(0.0);
+                    fy[a..b].fill(0.0);
+                }
+            }
+        });
+
+    // Relax, one task per row of chunks, in two rounds: even rows, then odd
+    // rows. A chunk's pairs reach into the chunk to its right (same task)
+    // and the chunk below (the next row), so two tasks of one round are
+    // always a whole row apart and never touch the same cell. The outcome
+    // does not depend on the number of threads.
     let tol = SETTLE * params.rel_tol;
-    let long_cap = LONG_FACE_SHARE / long as f32;
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let c = cy * cw + cx;
-            if !s.relaxing[c] {
-                continue;
-            }
-            let (x0, y0) = (cx * CHUNK, cy * CHUNK);
-            let mut ops = 0usize;
-
-            // Lengths of open runs, read from the flags. The scan starts a
-            // chunk's width beyond the chunk so runs that continue into the
-            // next chunk are counted; anything further out is assumed
-            // closed, which can only make a run look shorter. The flags of
-            // this chunk and of the ones to its right and below are all the
-            // runs depend on, so they are kept until one of those changes.
-            let key = [
-                d.flags_version[c],
-                right_of(cx, cy).map_or(0, |n| d.flags_version[n]),
-                below(cx, cy).map_or(0, |n| d.flags_version[n]),
-            ];
-            if s.run_key[c] != key {
-                s.run_key[c] = key;
-                let x_end = (x0 + 2 * CHUNK).min(w);
-                for y in y0..y0 + CHUNK {
-                    let mut run = 0u8;
-                    for x in (x0..x_end).rev() {
-                        let i = y * w + x;
-                        run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
-                        if x < x0 + CHUNK {
-                            s.run_right[i] = run;
-                        }
+    for round in 0..2usize.min(ch) {
+        p[round * band..]
+            .par_chunks_mut(2 * band)
+            .zip(fx[round * band..].par_chunks_mut(2 * band))
+            .zip(fy[round * band..].par_chunks_mut(2 * band))
+            .zip(run_right[round * band..].par_chunks_mut(2 * band))
+            .zip(run_down[round * band..].par_chunks_mut(2 * band))
+            .zip(run_key[round * cw..].par_chunks_mut(2 * cw))
+            .zip(run_max[round * cw..].par_chunks_mut(2 * cw))
+            .zip(relaxing[round * cw..].par_chunks_mut(2 * cw))
+            .enumerate()
+            .for_each(|(k, (((((((p, fx), fy), run_right), run_down), run_key), run_max), relaxing))| {
+                let cy = round + 2 * k;
+                let (base, cbase) = (cy * band, cy * cw);
+                let mut t = Relax {
+                    p: Off { s: p, base },
+                    fx: Off { s: fx, base },
+                    fy: Off { s: fy, base },
+                    run_right: Off { s: run_right, base },
+                    run_down: Off { s: run_down, base },
+                    run_key: Off { s: run_key, base: cbase },
+                    run_max: Off { s: run_max, base: cbase },
+                    relaxing: Off { s: relaxing, base: cbase },
+                    d,
+                    active,
+                    long,
+                    tol,
+                    pore_gas_flow: params.pore_gas_flow,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                };
+                for cx in 0..cw {
+                    if t.relaxing[cbase + cx] {
+                        relax_chunk(&mut t, cx, cy);
                     }
                 }
-                let y_end = (y0 + 2 * CHUNK).min(h);
-                let mut col = [0u8; CHUNK];
-                for y in (y0..y_end).rev() {
-                    for (k, run) in col.iter_mut().enumerate() {
-                        let i = y * w + x0 + k;
-                        *run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
-                        if y < y0 + CHUNK {
-                            s.run_down[i] = *run;
-                        }
-                    }
-                }
-            }
-
-            // Long pairs. `fx` and `fy` collect, for now, the amount
-            // entering a path at its first face and leaving at its last;
-            // the running sums further down turn that into a flux through
-            // every face. A long pair may end in the next chunk, and its
-            // whole path must be in chunks that are simulated this step.
-            let r = long;
-            let right_active = right_of(cx, cy).is_some_and(|n| chunks.active[n]);
-            let down_active = below(cx, cy).is_some_and(|n| chunks.active[n]);
-            let cols = if right_active { CHUNK } else { CHUNK.saturating_sub(r) };
-            let rows = if down_active { CHUNK } else { CHUNK.saturating_sub(r) };
-            for y in y0..y0 + CHUNK {
-                let base = y * w + x0;
-                let p = &mut s.p[base..base + cols + r];
-                let fx = &mut s.fx[base..base + cols + r];
-                let run = &s.run_right[base..base + cols];
-                for k in 0..cols {
-                    // A run longer than the distance means every cell from
-                    // here to the partner is open.
-                    if run[k] as usize > r {
-                        let (a, b) = (p[k], p[k + r]);
-                        let diff = a - b;
-                        if diff.abs() > tol * a.max(b) {
-                            let cap = long_cap * a.min(b);
-                            let delta = (0.5 * RELAX * diff).clamp(-cap, cap);
-                            p[k] = a - delta;
-                            p[k + r] = b + delta;
-                            fx[k] += delta;
-                            fx[k + r] -= delta;
-                            ops += 1;
-                        }
-                    }
-                }
-            }
-            for y in y0..y0 + rows {
-                let (i0, j0) = (y * w + x0, (y + r) * w + x0);
-                let (p_head, p_tail) = s.p.split_at_mut(j0);
-                let (f_head, f_tail) = s.fy.split_at_mut(j0);
-                let (pa, pb) = (&mut p_head[i0..i0 + CHUNK], &mut p_tail[..CHUNK]);
-                let (fa, fb) = (&mut f_head[i0..i0 + CHUNK], &mut f_tail[..CHUNK]);
-                let run = &s.run_down[i0..i0 + CHUNK];
-                for k in 0..CHUNK {
-                    if run[k] as usize > r {
-                        let (a, b) = (pa[k], pb[k]);
-                        let diff = a - b;
-                        if diff.abs() > tol * a.max(b) {
-                            let cap = long_cap * a.min(b);
-                            let delta = (0.5 * RELAX * diff).clamp(-cap, cap);
-                            pa[k] = a - delta;
-                            pb[k] = b + delta;
-                            fa[k] += delta;
-                            fb[k] -= delta;
-                            ops += 1;
-                        }
-                    }
-                }
-            }
-
-            // Adjacent pairs: every cell that is not a wall, open or not.
-            // The first pass covers the chunk. Repeats only cover the box
-            // around the pairs that moved a lot, since sharp differences
-            // are local (gas touching something hot, a burst).
-            let (mut bx0, mut by0, mut bx1, mut by1) = (x0, y0, x0 + CHUNK, y0 + CHUNK);
-            for _ in 0..MAX_LOCAL_PASSES {
-                let (mut nx0, mut ny0, mut nx1, mut ny1) = (usize::MAX, usize::MAX, 0, 0);
-                for y in by0..by1 {
-                    for x in bx0..bx1 {
-                        let i = y * w + x;
-                        let flags = d.flags[i];
-                        if flags & FIXED != 0 {
-                            continue;
-                        }
-                        for (j, in_world, vertical) in [(i + 1, x + 1 < w, false), (i + w, y + 1 < h, true)] {
-                            if !in_world {
-                                continue;
-                            }
-                            let delta = if flags & d.flags[j] & OPEN != 0 {
-                                relax_open(&mut s.p, i, j, tol)
-                            } else {
-                                relax_any(&mut s.p, &d.gas_vol, &d.flags, i, j, tol, params.pore_gas_flow)
-                            };
-                            if delta != 0.0 {
-                                let f = if vertical { &mut s.fy } else { &mut s.fx };
-                                f[i] += delta;
-                                f[j] -= delta;
-                                ops += 1;
-                                if delta.abs() >= REPEAT_ABOVE * s.p[i].max(s.p[j]) {
-                                    nx0 = nx0.min(x);
-                                    ny0 = ny0.min(y);
-                                    nx1 = nx1.max(x);
-                                    ny1 = ny1.max(y);
-                                }
-                            }
-                        }
-                    }
-                }
-                if nx0 > nx1 {
-                    break;
-                }
-                // Two cells of margin, kept inside this chunk.
-                bx0 = nx0.saturating_sub(2).max(x0);
-                by0 = ny0.saturating_sub(2).max(y0);
-                bx1 = (nx1 + 3).min(x0 + CHUNK);
-                by1 = (ny1 + 3).min(y0 + CHUNK);
-            }
-
-            // Nothing left to even out here: rest until the spread builds
-            // up again.
-            if ops == 0 {
-                s.relaxing[c] = false;
-            }
-        }
+            });
     }
 
     // Running sums along rows and down columns: the flux through a face is
     // everything that entered paths before it minus everything that left.
-    for cy in 0..ch {
+    // Each row of chunks does its own rows first, summing down from its own
+    // top edge only.
+    fx.par_chunks_mut(band).zip(fy.par_chunks_mut(band)).enumerate().for_each(|(cy, (fx, fy))| {
         for cx in 0..cw {
-            if !s.has_flux[cy * cw + cx] {
+            let c = cy * cw + cx;
+            if !has_flux[c] {
                 continue;
             }
-            let from_left = cx > 0 && s.has_flux[cy * cw + cx - 1];
-            let from_above = cy > 0 && s.has_flux[(cy - 1) * cw + cx];
-            for y in cy * CHUNK..(cy + 1) * CHUNK {
-                let row = y * w + cx * CHUNK;
-                let mut sum = if from_left { s.fx[row - 1] } else { 0.0 };
-                for i in row..row + CHUNK {
+            let from_left = cx > 0 && has_flux[c - 1];
+            for ly in 0..CHUNK {
+                let row = ly * w + cx * CHUNK;
+                // Left of `from` is wall, where the sum would restart
+                // anyway, and right of `to` nothing is read.
+                let [from, to] = d.row_span[c * CHUNK + ly];
+                let mut sum = if from == 0 && from_left { fx[row - 1] } else { 0.0 };
+                for i in row + from as usize..row + to as usize {
                     // Nothing flows through a wall, so restart there. This
                     // also stops rounding from building up along a row.
-                    if d.flags[i] & FIXED != 0 {
+                    if d.flags[cy * band + i] & FIXED != 0 {
                         sum = 0.0;
-                        s.fx[i] = 0.0;
-                        s.fy[i] = 0.0;
+                        fx[i] = 0.0;
+                        fy[i] = 0.0;
                         continue;
                     }
-                    sum += s.fx[i];
-                    s.fx[i] = sum;
-                    let above = if y > cy * CHUNK || from_above { s.fy[i - w] } else { 0.0 };
-                    s.fy[i] += above;
+                    sum += fx[i];
+                    fx[i] = sum;
+                    if ly > 0 {
+                        fy[i] += fy[i - w];
+                    }
                 }
             }
         }
+    });
+    // Then carry what comes down through each top edge on into the chunk
+    // below, as far as the first wall in each column. This has to go from
+    // the top of the world down, but it only visits columns of open space
+    // that cross a chunk boundary with a flux in them.
+    for cy in 1..ch {
+        for cx in 0..cw {
+            let c = cy * cw + cx;
+            if !has_flux[c] || !has_flux[c - cw] {
+                continue;
+            }
+            let top = cy * band + cx * CHUNK;
+            let mut carry = [0.0f32; CHUNK];
+            carry.copy_from_slice(&fy[top - w..top - w + CHUNK]);
+            for ly in 0..CHUNK {
+                let [from, to] = d.row_span[c * CHUNK + ly];
+                let (from, to) = (from as usize, to as usize);
+                carry[..from].fill(0.0);
+                carry[to..].fill(0.0);
+                let mut left = 0u32;
+                let row = top + ly * w;
+                for k in from..to {
+                    if d.flags[row + k] & FIXED != 0 {
+                        carry[k] = 0.0;
+                    } else {
+                        fy[row + k] += carry[k];
+                    }
+                    left |= carry[k].to_bits() << 1;
+                }
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Relax the pairs of one chunk: this step's long pairs, then adjacent ones.
+fn relax_chunk(t: &mut Relax, cx: usize, cy: usize) {
+    let (w, h, cw, ch, d, tol) = (t.w, t.h, t.cw, t.ch, t.d, t.tol);
+    let c = cy * cw + cx;
+    let right = (cx + 1 < cw).then(|| c + 1);
+    let down = (cy + 1 < ch).then(|| c + cw);
+    let (x0, y0) = (cx * CHUNK, cy * CHUNK);
+    let mut ops = 0usize;
+
+    // Lengths of open runs, read from the flags. The scan starts a chunk's
+    // width beyond the chunk so runs that continue into the next chunk are
+    // counted; anything further out is assumed closed, which can only make
+    // a run look shorter. The flags of this chunk and of the ones to its
+    // right and below are all the runs depend on, so they are kept until
+    // one of those changes.
+    let key = [d.flags_version[c], right.map_or(0, |n| d.flags_version[n]), down.map_or(0, |n| d.flags_version[n])];
+    if t.run_key[c] != key {
+        t.run_key[c] = key;
+        let (mut longest_right, mut longest_down) = (0u8, 0u8);
+        let x_end = (x0 + 2 * CHUNK).min(w);
+        for y in y0..y0 + CHUNK {
+            let mut run = 0u8;
+            for x in (x0..x_end).rev() {
+                let i = y * w + x;
+                run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
+                if x < x0 + CHUNK {
+                    t.run_right[i] = run;
+                    longest_right = longest_right.max(run);
+                }
+            }
+        }
+        let y_end = (y0 + 2 * CHUNK).min(h);
+        let mut col = [0u8; CHUNK];
+        for y in (y0..y_end).rev() {
+            for (k, run) in col.iter_mut().enumerate() {
+                let i = y * w + x0 + k;
+                *run = if d.flags[i] & OPEN != 0 { run.saturating_add(1) } else { 0 };
+                if y < y0 + CHUNK {
+                    t.run_down[i] = *run;
+                    longest_down = longest_down.max(*run);
+                }
+            }
+        }
+        t.run_max[c] = [longest_right, longest_down];
+    }
+
+    // Long pairs. `fx` and `fy` collect, for now, the amount entering a
+    // path at its first face and leaving at its last; the running sums in
+    // `solve` turn that into a flux through every face. A long pair may end
+    // in the next chunk, and its whole path must be in chunks that are
+    // simulated this step.
+    let r = t.long;
+    let long_cap = LONG_FACE_SHARE / r as f32;
+    let right_active = right.is_some_and(|n| t.active[n]);
+    let down_active = down.is_some_and(|n| t.active[n]);
+    let cols = if right_active { CHUNK } else { CHUNK.saturating_sub(r) };
+    let rows = if down_active { CHUNK } else { CHUNK.saturating_sub(r) };
+    let spans = &d.row_span[c * CHUNK..(c + 1) * CHUNK];
+    // No run in the chunk is long enough: nothing to look for.
+    let [longest_right, longest_down] = t.run_max[c];
+    let rows_h = if longest_right as usize > r { CHUNK } else { 0 };
+    let rows_v = if longest_down as usize > r { rows } else { 0 };
+    for y in y0..y0 + rows_h {
+        let base = y * w + x0;
+        let p = t.p.range(base, base + cols + r);
+        let fx = t.fx.range(base, base + cols + r);
+        let run = &t.run_right.range(base, base + cols)[..];
+        let [from, to] = spans[y - y0];
+        for k in from as usize..(to as usize).min(cols) {
+            // A run longer than the distance means every cell from here to
+            // the partner is open.
+            if run[k] as usize > r {
+                let (a, b) = (p[k], p[k + r]);
+                let diff = a - b;
+                if diff.abs() > tol * a.max(b) {
+                    let cap = long_cap * a.min(b);
+                    let delta = (0.5 * RELAX * diff).clamp(-cap, cap);
+                    p[k] = a - delta;
+                    p[k + r] = b + delta;
+                    fx[k] += delta;
+                    fx[k + r] -= delta;
+                    ops += 1;
+                }
+            }
+        }
+    }
+    for y in y0..y0 + rows_v {
+        let (i0, j0) = (y * w + x0, (y + r) * w + x0);
+        let (pa, pb) = t.p.two_runs(i0, j0, CHUNK);
+        let (fa, fb) = t.fy.two_runs(i0, j0, CHUNK);
+        let run = &t.run_down.range(i0, i0 + CHUNK)[..];
+        let [from, to] = spans[y - y0];
+        for k in from as usize..to as usize {
+            if run[k] as usize > r {
+                let (a, b) = (pa[k], pb[k]);
+                let diff = a - b;
+                if diff.abs() > tol * a.max(b) {
+                    let cap = long_cap * a.min(b);
+                    let delta = (0.5 * RELAX * diff).clamp(-cap, cap);
+                    pa[k] = a - delta;
+                    pb[k] = b + delta;
+                    fa[k] += delta;
+                    fb[k] -= delta;
+                    ops += 1;
+                }
+            }
+        }
+    }
+
+    // Adjacent pairs: every cell that is not a wall, open or not. The first
+    // pass covers the chunk. Repeats only cover the box around the pairs
+    // that moved a lot, since sharp differences are local (gas touching
+    // something hot, a burst).
+    let (mut bx0, mut by0, mut bx1, mut by1) = (x0, y0, x0 + CHUNK, y0 + CHUNK);
+    for _ in 0..MAX_LOCAL_PASSES {
+        let (mut nx0, mut ny0, mut nx1, mut ny1) = (usize::MAX, usize::MAX, 0, 0);
+        for y in by0..by1 {
+            let [from, to] = spans[y - y0];
+            for x in bx0.max(x0 + from as usize)..bx1.min(x0 + to as usize) {
+                let i = y * w + x;
+                let flags = d.flags[i];
+                if flags & FIXED != 0 {
+                    continue;
+                }
+                for (j, in_world, vertical) in [(i + 1, x + 1 < w, false), (i + w, y + 1 < h, true)] {
+                    if !in_world {
+                        continue;
+                    }
+                    let delta = if flags & d.flags[j] & OPEN != 0 {
+                        relax_open(&mut t.p, i, j, tol)
+                    } else {
+                        relax_any(&mut t.p, &d.gas_vol, &d.flags, i, j, tol, t.pore_gas_flow)
+                    };
+                    if delta != 0.0 {
+                        let f = if vertical { &mut t.fy } else { &mut t.fx };
+                        f[i] += delta;
+                        f[j] -= delta;
+                        ops += 1;
+                        if delta.abs() >= REPEAT_ABOVE * t.p[i].max(t.p[j]) {
+                            nx0 = nx0.min(x);
+                            ny0 = ny0.min(y);
+                            nx1 = nx1.max(x);
+                            ny1 = ny1.max(y);
+                        }
+                    }
+                }
+            }
+        }
+        if nx0 > nx1 {
+            break;
+        }
+        // Two cells of margin, kept inside this chunk.
+        bx0 = nx0.saturating_sub(2).max(x0);
+        by0 = ny0.saturating_sub(2).max(y0);
+        bx1 = (nx1 + 3).min(x0 + CHUNK);
+        by1 = (ny1 + 3).min(y0 + CHUNK);
+    }
+
+    // Nothing left to even out here: rest until the spread builds up again.
+    if ops == 0 {
+        t.relaxing[c] = false;
     }
 }
 
@@ -419,7 +570,7 @@ pub fn solve(world: &mut World) {
 /// their volumes are taken as one cell each. Returns the `pV` that goes from
 /// `i` to `j`, or zero if the two are already close enough.
 #[inline(always)]
-fn relax_open(p: &mut [f32], i: usize, j: usize, tol: f32) -> f32 {
+fn relax_open(p: &mut Off<f32>, i: usize, j: usize, tol: f32) -> f32 {
     let diff = p[i] - p[j];
     if diff.abs() <= tol * p[i].max(p[j]) {
         return 0.0;
@@ -433,7 +584,7 @@ fn relax_open(p: &mut [f32], i: usize, j: usize, tol: f32) -> f32 {
 /// The same for any two adjacent cells that are not walls: partly filled
 /// cells, where the gas volumes differ, and powder, where flow is slowed.
 #[inline(always)]
-fn relax_any(p: &mut [f32], vol: &[f32], flags: &[u8], i: usize, j: usize, tol: f32, pore_flow: f32) -> f32 {
+fn relax_any(p: &mut Off<f32>, vol: &[f32], flags: &[u8], i: usize, j: usize, tol: f32, pore_flow: f32) -> f32 {
     let (vi, vj) = (vol[i], vol[j]);
     if flags[j] & FIXED != 0 || vi <= EPS_VOL || vj <= EPS_VOL {
         return 0.0;

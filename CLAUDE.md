@@ -12,7 +12,7 @@ Read these before changing anything:
 `cargo` is installed in `~/.cargo/bin` and may not be on PATH: `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 ```
-cargo test --release --workspace                 # 17 behaviour tests, about 7 s
+cargo test --release --workspace                 # 19 behaviour tests, about 5 s
 cargo run --release -p viewer                    # interactive viewer
 cargo run --release -p viewer                    # default scene is caves; --open for open air
 cargo run --release -p viewer -- --stress        # benchmark scene, every chunk busy
@@ -43,7 +43,7 @@ crates/sim/                 the engine; only dependency is rayon
   src/render.rs             cells to RGBA, three views
   src/scene.rs              caves (viewer default, the game's setting), playground (open air), demo (stress), gas_noise (worst case)
   examples/bench.rs         benchmark
-  examples/threads.rs       cave-scene step time; run with RAYON_NUM_THREADS=n to compare
+  examples/threads.rs       cave-scene step time by pass, and draw time; RAYON_NUM_THREADS=n to compare, optional W H
   tests/physics.rs          behaviour tests
 crates/viewer/              macroquad front end
 ```
@@ -68,8 +68,10 @@ Step order in `World::step`: derive, heat, gas, grains, liquid. Inside the gas p
 - Measure before and after any change to a pass with the benchmark. `perf record` works on this machine for profiling.
 - Before an experiment that rewrites a pass, make sure the starting point is committed or copied to `/tmp`, so it can be backed out exactly.
 - Timings on this laptop move with load and core frequency by tens of percent. To compare two versions, build the old one in a `git worktree` under `/tmp` and run both back to back in the same shell; do not compare against numbers from earlier in the day.
-- The step is limited by memory traffic more than arithmetic (see roadmap). Trimming instructions inside a pass has repeatedly gained nothing; touching fewer bytes per cell is what helps.
-- Parallel passes work on rows of chunks. A task may only write cells in its own row, or its own row and the one below when rows are done in two alternating rounds (`gas::faces`). `Off` lets such a task keep using world indices. Results must not depend on the number of threads.
+- Before deciding why something is slow, measure it: `perf stat -e cycles,instructions,cache-misses` for the whole run, `perf record -e instructions` to see which function executes the most. A guess that the step was memory-bound cost a wrong recommendation; the counters showed 2.85 instructions per cycle, which is a busy processor. What has worked: doing each thing once, loops without branches that the compiler can vectorise, skipping rock, and a quick path for the common case.
+- Helper cores on this laptop clock down when idle between short parallel sections, so a half-parallel step gains little and two threads do nearly as well as eight. Judge threading on the whole step, not one pass.
+- Parallel passes work on rows of chunks, or thinner strips of rows. A task may only write cells in its own rows, or its own and the ones below when tasks run in two alternating rounds (`gas::faces`, `pressure::solve`). `Off` lets such a task keep using world indices. Results must not depend on the number of threads; `result_does_not_depend_on_thread_count` checks that bit for bit, so serial passes that use `world.rng` must stay serial or get a random stream per chunk.
+- `Derived::row_span` says where the non-wall cells of each chunk row are. Gas code should loop over that range. Anything that changes `Derived::flags` outside the derive pass must also keep the spans and `flags_version` right.
 - Order matters between passes: anything that moves or heats gas before `pressure::solve` must also update the `derived` snapshot (see `heat.rs` and `gas::sink`), or the solver acts on stale pressures and produces spikes.
 
 ## Working with the user
