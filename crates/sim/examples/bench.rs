@@ -1,6 +1,7 @@
 //! Step-time benchmark.
 //!
-//!   cargo run --release -p sim --example bench
+//!   cargo run --release -p sim --example bench            # everything, about 6 min
+//!   cargo run --release -p sim --example bench -- caves   # only scenes whose name contains "caves"
 //!   cargo run --release -p sim --example bench --features slots-6
 //!   cargo run --release -p sim --example bench --features slots-4
 
@@ -57,7 +58,24 @@ fn report(name: &str, world: &World, s: &Summary) {
     );
 }
 
+/// Run a scene for a minute of simulated time, reporting three stretches.
+fn long_run(name: &str, w: usize, h: usize, build: fn(&mut World)) {
+    let mut world = World::new(w, h, Substances::builtin());
+    build(&mut world);
+    let s = measure(&mut world, 300);
+    report(&format!("{name}, first 5 s"), &world, &s);
+    let s = measure(&mut world, 900);
+    report(&format!("{name}, 5 to 20 s"), &world, &s);
+    for _ in 0..2400 {
+        world.step();
+    }
+    let s = measure(&mut world, 300);
+    report(&format!("{name}, after 1 min"), &world, &s);
+}
+
 fn main() {
+    let filter = std::env::args().nth(1).unwrap_or_default();
+    let wanted = |name: &str| name.contains(&filter);
     println!(
         "slots per cell: {SLOTS}   cell size: {} bytes   single thread",
         std::mem::size_of::<Cell>()
@@ -65,39 +83,35 @@ fn main() {
     for (w, h) in [(640, 384), (1024, 512)] {
         println!("\n{w} x {h} cells ({:.1} MB of cells)", (w * h * std::mem::size_of::<Cell>()) as f64 / 1e6);
 
-        let mut world = World::new(w, h, Substances::builtin());
-        scene::demo(&mut world);
-        let s = measure(&mut world, 300);
-        report("demo, first 5 s", &world, &s);
-        let s = measure(&mut world, 300);
-        report("demo, 5 to 10 s", &world, &s);
-        for _ in 0..1200 {
-            world.step();
-        }
-        let s = measure(&mut world, 120);
-        report("demo, after 30 s", &world, &s);
-
-        if w >= 448 && h >= 256 {
+        if wanted("demo") {
             let mut world = World::new(w, h, Substances::builtin());
-            scene::playground(&mut world);
+            scene::demo(&mut world);
             let s = measure(&mut world, 300);
-            report("playground, first 5 s", &world, &s);
-            let s = measure(&mut world, 900);
-            report("playground, 5 to 20 s", &world, &s);
-            for _ in 0..2400 {
+            report("demo, first 5 s", &world, &s);
+            let s = measure(&mut world, 300);
+            report("demo, 5 to 10 s", &world, &s);
+            for _ in 0..1200 {
                 world.step();
             }
-            let s = measure(&mut world, 300);
-            report("playground, after 1 min", &world, &s);
+            let s = measure(&mut world, 120);
+            report("demo, after 30 s", &world, &s);
         }
-
-        let mut world = World::new(w, h, Substances::builtin());
-        scene::gas_noise(&mut world);
-        let s = measure(&mut world, 60);
-        report("gas noise (worst case)", &world, &s);
-
-        let mut world = World::new(w, h, Substances::builtin());
-        let s = measure(&mut world, 120);
-        report("still air", &world, &s);
+        if wanted("caves") {
+            long_run("caves", w, h, scene::caves);
+        }
+        if wanted("playground") {
+            long_run("playground", w, h, scene::playground);
+        }
+        if wanted("gas noise") {
+            let mut world = World::new(w, h, Substances::builtin());
+            scene::gas_noise(&mut world);
+            let s = measure(&mut world, 60);
+            report("gas noise (worst case)", &world, &s);
+        }
+        if wanted("still air") {
+            let mut world = World::new(w, h, Substances::builtin());
+            let s = measure(&mut world, 120);
+            report("still air", &world, &s);
+        }
     }
 }

@@ -1,6 +1,6 @@
 # 2D physics simulation
 
-A grid-based 2D physics engine in Rust, meant to be used later for a game. Target: all 94 natural elements in three phases with real densities and temperatures, falling-sand powders, diggable walls, basic chemistry, dissolving, 60 fps, world larger than a screen.
+A grid-based 2D physics engine in Rust, meant to be used later for a game set underground (a sealed world of rock and caves). Target: all 94 natural elements in three phases with real densities and temperatures, falling-sand powders, diggable walls, basic chemistry, dissolving, 60 fps, world larger than a screen.
 
 Read these before changing anything:
 
@@ -14,9 +14,11 @@ Read these before changing anything:
 ```
 cargo test --release --workspace                 # 16 behaviour tests, about 6 s
 cargo run --release -p viewer                    # interactive viewer
+cargo run --release -p viewer                    # default scene is caves; --open for open air
 cargo run --release -p viewer -- --stress        # benchmark scene, every chunk busy
 cargo run --release -p viewer -- --screenshot /tmp/shot.png 120   # run 120 frames, save PNG, quit
-cargo run --release -p sim --example bench       # step-time benchmark, about 5 min; use a 600 s timeout
+cargo run --release -p sim --example bench       # everything, about 6 min; too long for one 600 s call
+cargo run --release -p sim --example bench -- caves   # one scene by name: demo, caves, playground, "gas noise", "still air"
 cargo run --release -p sim --example bench --features slots-6     # or slots-4
 cargo clippy --release --workspace --all-targets
 ```
@@ -39,7 +41,7 @@ crates/sim/                 the engine, no dependencies
   src/heat.rs gas.rs grains.rs liquid.rs    the four passes
   src/pressure.rs           scalar pressure relaxation, called from the gas pass
   src/render.rs             cells to RGBA, three views
-  src/scene.rs              playground (viewer), demo (stress), gas_noise (worst case)
+  src/scene.rs              caves (viewer default, the game's setting), playground (open air), demo (stress), gas_noise (worst case)
   examples/bench.rs         benchmark
   tests/physics.rs          behaviour tests
 crates/viewer/              macroquad front end

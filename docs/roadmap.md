@@ -65,8 +65,27 @@ Options, not yet chosen:
 
 1. Multithreading (step 6). Every pass is per chunk already; 8 cores would bring the playground back under budget.
 2. Make awake-but-quiet cells cheaper: derive only cells that changed, merge the several per-chunk scans in the gas pass into one.
-3. Give the world open edges held at ambient pressure, so a heat source does not pressurise everything. This changes what the world is, so it is the user's call.
+3. Open world edges held at ambient pressure (or vacuum, as in Oxygen Not Included). Ruled out by the user on 2026-11-26: the game is underground, so gas has nowhere to escape. Real gravity could not hold gas in anyway: air pressure only falls 0.06% over 5 m.
 4. A wider dead band. 1% would cut the work but leaves pressure visibly uneven; not recommended.
+
+## Cave scene (the game is underground)
+
+The user's game is set underground, so the world is sealed by rock and open edges are off the table. `scene::caves` is the representative scene: solid rock with one chamber per 128×128 tile, some linked by tunnels. Five chambers in six hold something (water and sand, mercury and gold, helium, a 700 K bar, a 1500 K bar). It is the viewer's default; `--open` gives the old playground.
+
+Measured 2026-11-26, same machine, `bench -- caves`:
+
+| Size | First 5 s | 5 to 20 s | After 1 min | Awake chunks |
+|---|---|---|---|---|
+| 640×384 | 16.8 ms | 12.3 ms | 10.7 ms | about 50 of 60 |
+| 1024×512 | 26.0 ms | 26.0 ms | 26.4 ms | about 105 of 128 |
+
+The guess that rock would make this cheap was wrong:
+
+- **Cost goes by awake chunk, not by awake gas cell.** A chunk is 64×64 and is simulated whole if anything in it is active. Chambers and tunnels touch most chunks, so most chunks are awake even though most cells are rock.
+- **A rock cell in an awake chunk is not free.** It is still derived (about 16 ns) and scanned by each pass. An awake chunk costs 0.21–0.25 ms whatever it holds, so the 16.7 ms budget is about 65–80 awake chunks, roughly one screen at zoom 2.
+- **Helium and hot bars never settle**, so their chambers stay awake for the whole run. Water and sand chambers do go to sleep.
+
+What would help here, cheapest first: make solid cells nearly free inside awake chunks (skip derive for cells that did not change; skip rows or runs of rock in the gas passes); smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk); multithreading.
 
 ## Known problems
 

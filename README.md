@@ -25,7 +25,7 @@ cargo run --release -p viewer
 | C | clear to air |
 | H | hide help |
 
-Viewer options: `--empty`, `--stress`, `--size W H` (multiples of 64), `--screenshot PATH N`.
+Viewer options: `--open` (open-air scene instead of caves), `--empty`, `--stress`, `--size W H` (multiples of 64), `--screenshot PATH N`.
 
 ## Develop
 

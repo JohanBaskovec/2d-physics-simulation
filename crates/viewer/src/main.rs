@@ -4,6 +4,7 @@
 //!
 //! Options:
 //!   --empty                 start with nothing but air
+//!   --open                  start with the open-air playground scene
 //!   --stress                start with the benchmark scene (every chunk busy)
 //!   --size W H              world size in cells (multiples of 64)
 //!   --screenshot PATH N     run N frames, save a screenshot, and quit
@@ -20,7 +21,7 @@ const HELP: &[&str] = &[
     "wheel       zoom           WASD/arrows  pan (or drag middle mouse)",
     "Space       pause          .            single step",
     "V           view: material / temperature / pressure",
-    "R           reset demo     C            clear to air      H  hide help",
+    "R           reset scene    C            clear to air      H  hide help",
 ];
 
 /// The four ways a substance can be painted.
@@ -34,17 +35,19 @@ const FORMS: [(Form, &str); 4] = [
 struct Args {
     empty: bool,
     stress: bool,
+    open: bool,
     size: (usize, usize),
     screenshot: Option<(String, u32)>,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { empty: false, stress: false, size: (1024, 512), screenshot: None };
+    let mut args = Args { empty: false, stress: false, open: false, size: (1024, 512), screenshot: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--empty" => args.empty = true,
             "--stress" => args.stress = true,
+            "--open" => args.open = true,
             "--size" => {
                 let w = it.next().and_then(|v| v.parse().ok()).expect("--size needs W H");
                 let h = it.next().and_then(|v| v.parse().ok()).expect("--size needs W H");
@@ -121,10 +124,14 @@ async fn main() {
     let args = parse_args();
     let build = |empty: bool| -> World {
         let mut world = World::new(args.size.0, args.size.1, Substances::builtin());
-        if args.stress && !empty {
+        if empty {
+            // nothing but air
+        } else if args.stress {
             scene::demo(&mut world);
-        } else if !empty {
+        } else if args.open {
             scene::playground(&mut world);
+        } else {
+            scene::caves(&mut world);
         }
         world
     };
