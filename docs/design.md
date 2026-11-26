@@ -104,7 +104,7 @@ Still simplified: gas has no momentum (no wind that keeps blowing, no sound), li
 - The heat pass collects all flows first (`World::heat_gain`) and applies them afterwards, so results do not depend on visiting order and the snapshot can be brought up to date for the gas pass.
 - Gas uses a cheap f32 transfer (`move_fast`) for partial flows and the exact f64 `Pair` when a cell may be emptied. The f64 path exists because a cell that loses almost all its matter would otherwise get its leftover energy from the difference of two large f32 numbers.
 - Liquid cells deep inside a still pool are skipped by a snapshot test (`liquid::at_rest`).
-- Single-threaded for now. Passes edit neighbouring chunks in place, so threading needs the checkerboard scheme (roadmap step 6).
+- **Threads.** Derive, heat, gas summaries and gas face transfers run in parallel over rows of chunks using rayon; the rest is serial. Heat has each cell add up its own four faces, so no task writes another's cells; this evaluates every face twice, and the flow formula is written to give exactly opposite results from the two sides so energy is still conserved. Face transfers write into the row below, so rows run in two alternating rounds. Results are identical for any number of threads. Gain so far is small; see the roadmap.
 
 ## Planned but not designed in detail
 

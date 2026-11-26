@@ -30,7 +30,7 @@ Always use `--release`. Debug builds are too slow to judge behaviour.
 ## Layout
 
 ```
-crates/sim/                 the engine, no dependencies
+crates/sim/                 the engine; only dependency is rayon
   data/substances.csv       substance table (placeholder rows, see roadmap)
   src/lib.rs                constants: SLOTS, DT, GRAVITY, PACKING, CHUNK, tolerances
   src/cell.rs               Cell (64 bytes), Form, Kind, per-cell derived values
@@ -43,6 +43,7 @@ crates/sim/                 the engine, no dependencies
   src/render.rs             cells to RGBA, three views
   src/scene.rs              caves (viewer default, the game's setting), playground (open air), demo (stress), gas_noise (worst case)
   examples/bench.rs         benchmark
+  examples/threads.rs       cave-scene step time; run with RAYON_NUM_THREADS=n to compare
   tests/physics.rs          behaviour tests
 crates/viewer/              macroquad front end
 ```
@@ -65,7 +66,10 @@ Step order in `World::step`: derive, heat, gas, grains, liquid. Inside the gas p
 - Comments explain why, and name the simplification when physics is being approximated.
 - Add a behaviour test in `tests/physics.rs` for every new rule. Conservation is checked by `mixed_scene_conserves_matter_and_energy`; extend that scene when adding substances or forms.
 - Measure before and after any change to a pass with the benchmark. `perf record` works on this machine for profiling.
-- There is no git history to fall back on unless the user has committed. Before an experiment that rewrites a pass, copy the files to `/tmp` so it can be backed out exactly.
+- Before an experiment that rewrites a pass, make sure the starting point is committed or copied to `/tmp`, so it can be backed out exactly.
+- Timings on this laptop move with load and core frequency by tens of percent. To compare two versions, build the old one in a `git worktree` under `/tmp` and run both back to back in the same shell; do not compare against numbers from earlier in the day.
+- The step is limited by memory traffic more than arithmetic (see roadmap). Trimming instructions inside a pass has repeatedly gained nothing; touching fewer bytes per cell is what helps.
+- Parallel passes work on rows of chunks. A task may only write cells in its own row, or its own row and the one below when rows are done in two alternating rounds (`gas::faces`). `Off` lets such a task keep using world indices. Results must not depend on the number of threads.
 - Order matters between passes: anything that moves or heats gas before `pressure::solve` must also update the `derived` snapshot (see `heat.rs` and `gas::sink`), or the solver acts on stale pressures and produces spikes.
 
 ## Working with the user

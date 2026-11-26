@@ -115,6 +115,15 @@ impl Chunks {
         }
     }
 
+    /// Wake the chunk holding (x, y) and any chunk that cell borders,
+    /// without marking the cell. For changes to energy only, which the heat
+    /// pass folds into the derived values itself.
+    pub fn touch_chunk_of(&mut self, x: usize, y: usize) {
+        let was = self.stale[y * self.w + x];
+        self.touch(x, y);
+        self.stale[y * self.w + x] = was;
+    }
+
     #[inline]
     pub fn touch_index(&mut self, i: usize) {
         self.touch(i % self.w, i / self.w);
@@ -168,6 +177,14 @@ impl Dirty {
         self.x0 > self.x1
     }
 
+    /// The box as `[x0, y0, x1, y1]`, if anything was recorded, and reset.
+    /// For tasks that cannot reach the chunk list and hand their boxes back.
+    pub fn take(&mut self) -> Option<[usize; 4]> {
+        let out = (!self.is_empty()).then_some([self.x0, self.y0, self.x1, self.y1]);
+        *self = Dirty::new();
+        out
+    }
+
     /// Wake every chunk the box overlaps or borders, then reset. The box
     /// must be no larger than a chunk plus one cell, so its corners reach
     /// every chunk it covers.
@@ -185,6 +202,53 @@ impl Dirty {
 impl Default for Dirty {
     fn default() -> Self {
         Dirty::new()
+    }
+}
+
+/// Part of a per-cell array, indexed with the same cell indices as the
+/// whole array. Lets a task that was handed a few rows of the world keep
+/// using world coordinates.
+pub struct Off<'a, T> {
+    pub s: &'a mut [T],
+    /// Index in the whole array of this part's first element.
+    pub base: usize,
+}
+
+impl<T> Off<'_, T> {
+    /// Two different elements at once, `i` before `j`.
+    #[inline(always)]
+    pub fn two(&mut self, i: usize, j: usize) -> (&mut T, &mut T) {
+        let (head, tail) = self.s.split_at_mut(j - self.base);
+        (&mut head[i - self.base], &mut tail[0])
+    }
+
+    /// The elements from `a` up to `b`.
+    #[inline(always)]
+    pub fn range(&mut self, a: usize, b: usize) -> &mut [T] {
+        &mut self.s[a - self.base..b - self.base]
+    }
+
+    /// Two runs of `n` elements at once, the one at `i` wholly before the
+    /// one at `j`.
+    #[inline(always)]
+    pub fn two_runs(&mut self, i: usize, j: usize, n: usize) -> (&mut [T], &mut [T]) {
+        let (head, tail) = self.s.split_at_mut(j - self.base);
+        (&mut head[i - self.base..i - self.base + n], &mut tail[..n])
+    }
+}
+
+impl<T> std::ops::Index<usize> for Off<'_, T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &T {
+        &self.s[i - self.base]
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for Off<'_, T> {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        &mut self.s[i - self.base]
     }
 }
 
@@ -299,6 +363,15 @@ impl World {
 
     /// Advance the simulation by one time step.
     pub fn step(&mut self) {
+        // Run the whole step on one of the worker threads. If the caller's
+        // thread ran it, that thread would be put to sleep at every parallel
+        // section and woken after it, and on a laptop a core that has just
+        // been asleep runs slowly for a while. Measured: the single-threaded
+        // passes took twice as long that way.
+        rayon::scope(|_| self.step_on_worker());
+    }
+
+    fn step_on_worker(&mut self) {
         self.chunks.advance();
         self.stats.active_chunks = self.chunks.active_count();
 

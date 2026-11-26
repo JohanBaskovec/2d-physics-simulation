@@ -8,3 +8,6 @@ edition = "2021"
 # These exist so the benchmark can compare smaller layouts.
 slots-6 = []
 slots-4 = []
+
+[dependencies]
+rayon = "1"

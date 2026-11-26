@@ -13,9 +13,11 @@
 //!   pressure in still air is uniform. Buoyancy is a separate rule
 //!   ([`overturn`]) and works within a column only.
 
-use crate::cell::Form;
-use crate::derive::{FIXED, OPEN, POWDER};
-use crate::world::{Dirty, World};
+use crate::cell::{Cell, Form};
+use crate::derive::{Derived, FIXED, OPEN, POWDER};
+use crate::substance::Substances;
+use crate::world::{Dirty, Off, Params, World};
+use rayon::prelude::*;
 use crate::xfer::{exchange_gas, move_fast, Pair};
 use crate::{CHUNK, SLOTS};
 
@@ -32,41 +34,108 @@ pub fn run(world: &mut World) {
     overturn(world);
     crate::pressure::solve(world);
 
-    let (w, h) = (world.chunks.w, world.chunks.h);
-    let (cw, ch) = (world.chunks.cw, world.chunks.ch);
+    faces(world);
+}
+
+/// Everything one task needs to move gas across the faces of one row of
+/// chunks. `cells` and `stale` cover that row and the one below it (a face
+/// on the bottom edge reaches one cell into the next row); the rest is
+/// shared and read-only.
+struct Faces<'a> {
+    cells: Off<'a, Cell>,
+    stale: Off<'a, u8>,
+    d: &'a Derived,
+    fx: &'a [f32],
+    fy: &'a [f32],
+    params: &'a Params,
+    subs: &'a Substances,
+    step: u64,
+    w: usize,
+}
+
+/// Move gas across every cell face that has a pressure flux or gas still
+/// mixing.
+///
+/// Rows of chunks are handled in parallel, in two rounds: even rows, then
+/// odd rows. A task changes cells in its own row and the top line of the
+/// row below, so two tasks in the same round are always a whole row apart
+/// and can never touch the same cell. The result does not depend on how
+/// many threads there are.
+fn faces(world: &mut World) {
+    let World { cells, chunks, derived, press, params, subs, .. } = world;
+    let (w, h, cw, ch) = (chunks.w, chunks.h, chunks.cw, chunks.ch);
+    let step = world.step_count;
     // Alternate sweep direction so no side is favoured.
-    let flip = world.step_count & 1 == 1;
-    let mut dirty = Dirty::new();
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let c = cy * cw + cx;
-            if !world.chunks.active[c] {
-                continue;
-            }
-            // Nothing can happen at any face of a chunk with no pressure
-            // flux and the same gas throughout.
-            let right = (cx + 1 < cw).then(|| c + 1);
-            let down = (cy + 1 < ch).then(|| c + cw);
-            let flux = world.press.has_flux[c];
-            if !flux && world.press.density_uniform(c, right, down, world.params.mix_tol) {
-                continue;
-            }
-            for y in cy * CHUNK..(cy + 1) * CHUNK {
-                for k in 0..CHUNK {
-                    let x = cx * CHUNK + if flip { CHUNK - 1 - k } else { k };
-                    // Nothing crosses the faces of a wall.
-                    if world.derived.flags[y * w + x] & FIXED != 0 {
+    let flip = step & 1 == 1;
+    let band = w * CHUNK;
+    // A copy, because waking chunks between the rounds changes the list.
+    let active: Vec<bool> = chunks.active.clone();
+    let press: &crate::pressure::Scratch = press;
+    let derived: &Derived = derived;
+    let (params, subs): (&Params, &Substances) = (params, subs);
+
+    for round in 0..2 {
+        if round * band >= cells.len() {
+            break;
+        }
+        let boxes: Vec<Vec<[usize; 4]>> = cells[round * band..]
+            .par_chunks_mut(2 * band)
+            .zip(chunks.stale[round * band..].par_chunks_mut(2 * band))
+            .enumerate()
+            .map(|(k, (cells, stale))| {
+                let cy = round + 2 * k;
+                let base = cy * band;
+                let mut v = Faces {
+                    cells: Off { s: cells, base },
+                    stale: Off { s: stale, base },
+                    d: derived,
+                    fx: &press.fx,
+                    fy: &press.fy,
+                    params,
+                    subs,
+                    step,
+                    w,
+                };
+                let mut boxes = Vec::new();
+                let mut dirty = Dirty::new();
+                for cx in 0..cw {
+                    let c = cy * cw + cx;
+                    if !active[c] {
                         continue;
                     }
-                    if x + 1 < w {
-                        pair(world, &mut dirty, x, y, false, flux);
+                    // Nothing can happen at any face of a chunk with no
+                    // pressure flux and the same gas throughout.
+                    let right = (cx + 1 < cw).then(|| c + 1);
+                    let down = (cy + 1 < ch).then(|| c + cw);
+                    let flux = press.has_flux[c];
+                    if !flux && press.density_uniform(c, right, down, params.mix_tol) {
+                        continue;
                     }
-                    if y + 1 < h {
-                        pair(world, &mut dirty, x, y, true, flux);
+                    for y in cy * CHUNK..(cy + 1) * CHUNK {
+                        for k in 0..CHUNK {
+                            let x = cx * CHUNK + if flip { CHUNK - 1 - k } else { k };
+                            // Nothing crosses the faces of a wall.
+                            if derived.flags[y * w + x] & FIXED != 0 {
+                                continue;
+                            }
+                            if x + 1 < w {
+                                pair(&mut v, &mut dirty, x, y, false, flux);
+                            }
+                            if y + 1 < h {
+                                pair(&mut v, &mut dirty, x, y, true, flux);
+                            }
+                        }
                     }
+                    boxes.extend(dirty.take());
                 }
-            }
-            dirty.flush(&mut world.chunks);
+                boxes
+            })
+            .collect();
+        for &[x0, y0, x1, y1] in boxes.iter().flatten() {
+            chunks.touch_chunk_of(x0, y0);
+            chunks.touch_chunk_of(x1, y0);
+            chunks.touch_chunk_of(x0, y1);
+            chunks.touch_chunk_of(x1, y1);
         }
     }
 }
@@ -116,21 +185,21 @@ fn overturn(world: &mut World) {
 /// Exchange gas between the cell at (x, y) and its right neighbour, or its
 /// lower neighbour if `vertical`.
 #[inline]
-fn pair(world: &mut World, dirty: &mut Dirty, x: usize, y: usize, vertical: bool, has_flux: bool) {
-    let w = world.chunks.w;
+fn pair(v: &mut Faces, dirty: &mut Dirty, x: usize, y: usize, vertical: bool, has_flux: bool) {
+    let w = v.w;
     let i = y * w + x;
     let (j, jx, jy) = if vertical { (i + w, x, y + 1) } else { (i + 1, x + 1, y) };
-    let d = &world.derived;
+    let d = v.d;
     let (ra, rb) = (d.gas_rho[i], d.gas_rho[j]);
-    let params = &world.params;
+    let params = v.params;
     // Flux the pressure pass wants through this face, as `pV` going from
     // this cell to the neighbour (negative: the other way).
     let flux = if !has_flux {
         0.0
     } else if vertical {
-        world.press.fy[i]
+        v.fy[i]
     } else {
-        world.press.fx[i]
+        v.fx[i]
     };
     let (ga, gb) = (d.gas_pv[i], d.gas_pv[j]);
     let push = if flux > 0.0 { flux > params.gas_flow_tol * ga } else { -flux > params.gas_flow_tol * gb };
@@ -166,7 +235,7 @@ fn pair(world: &mut World, dirty: &mut Dirty, x: usize, y: usize, vertical: bool
         dirty.add_pair(x, y, jx, jy);
 
         // Diffusion: neighbours trade a small, equal volume of gas.
-        let turn = (x + y + vertical as usize * (DIFFUSE_EVERY / 2) + world.step_count as usize)
+        let turn = (x + y + vertical as usize * (DIFFUSE_EVERY / 2) + v.step as usize)
             % DIFFUSE_EVERY
             == 0;
         if turn {
@@ -184,9 +253,8 @@ fn pair(world: &mut World, dirty: &mut Dirty, x: usize, y: usize, vertical: bool
     let (ta, tb) = (d.temp[i], d.temp[j]);
 
     // `j` is always after `i`, so the slice can be split between them.
-    let (head, tail) = world.cells.split_at_mut(j);
-    let (a, b) = (&mut head[i], &mut tail[0]);
-    let subs = &world.subs;
+    let (a, b) = v.cells.two(i, j);
+    let subs = v.subs;
     // Amounts are read before anything moves, so gas that arrives in this
     // exchange is not sent straight back.
     let mut gas_a = [0.0f32; SLOTS];
@@ -220,8 +288,8 @@ fn pair(world: &mut World, dirty: &mut Dirty, x: usize, y: usize, vertical: bool
             b.energy = 0.0;
         }
         dirty.add_pair(x, y, jx, jy);
-        world.chunks.stale[i] = 1;
-        world.chunks.stale[j] = 1;
+        v.stale[i] = 1;
+        v.stale[j] = 1;
     }
 }
 

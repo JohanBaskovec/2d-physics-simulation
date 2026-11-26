@@ -29,6 +29,7 @@
 
 use crate::derive::{FIXED, OPEN, POWDER};
 use crate::world::World;
+use rayon::prelude::*;
 use crate::{CHUNK, EPS_VOL};
 
 /// Distances of the long pairs. Each step runs one of these, in turn, and
@@ -130,37 +131,45 @@ impl Scratch {
 /// Runs after the heat pass, so it sees this step's heating.
 pub fn summarise(world: &mut World) {
     let World { chunks, derived: d, press: s, .. } = world;
-    let w = chunks.w;
-    for cy in 0..chunks.ch {
-        for cx in 0..chunks.cw {
-            let c = cy * chunks.cw + cx;
-            if !chunks.active[c] {
-                continue;
-            }
-            let (mut p_lo, mut p_hi) = (f32::MAX, f32::MIN);
-            let (mut r_lo, mut r_hi) = (f32::MAX, f32::MIN);
-            for y in cy * CHUNK..(cy + 1) * CHUNK {
-                let row = y * w + cx * CHUNK;
-                for i in row..row + CHUNK {
-                    // Cells with no room for gas have no gas pressure.
-                    if d.gas_vol[i] > EPS_VOL && d.flags[i] & FIXED == 0 {
-                        p_lo = p_lo.min(d.pressure[i]);
-                        p_hi = p_hi.max(d.pressure[i]);
-                        r_lo = r_lo.min(d.gas_rho[i]);
-                        r_hi = r_hi.max(d.gas_rho[i]);
+    let (w, cw) = (chunks.w, chunks.cw);
+    let d: &crate::derive::Derived = d;
+    let active: &[bool] = &chunks.active;
+    // One task per row of chunks; each writes only its own chunks' entries.
+    s.p_min
+        .par_chunks_mut(cw)
+        .zip(s.p_max.par_chunks_mut(cw))
+        .zip(s.rho_min.par_chunks_mut(cw))
+        .zip(s.rho_max.par_chunks_mut(cw))
+        .enumerate()
+        .for_each(|(cy, (((p_min, p_max), rho_min), rho_max))| {
+            for cx in 0..cw {
+                if !active[cy * cw + cx] {
+                    continue;
+                }
+                let (mut p_lo, mut p_hi) = (f32::MAX, f32::MIN);
+                let (mut r_lo, mut r_hi) = (f32::MAX, f32::MIN);
+                for y in cy * CHUNK..(cy + 1) * CHUNK {
+                    let row = y * w + cx * CHUNK;
+                    for i in row..row + CHUNK {
+                        // Cells with no room for gas have no gas pressure.
+                        if d.gas_vol[i] > EPS_VOL && d.flags[i] & FIXED == 0 {
+                            p_lo = p_lo.min(d.pressure[i]);
+                            p_hi = p_hi.max(d.pressure[i]);
+                            r_lo = r_lo.min(d.gas_rho[i]);
+                            r_hi = r_hi.max(d.gas_rho[i]);
+                        }
                     }
                 }
+                if p_lo > p_hi {
+                    // No gas space at all in this chunk.
+                    (p_lo, p_hi, r_lo, r_hi) = (0.0, 0.0, 0.0, 0.0);
+                }
+                p_min[cx] = p_lo;
+                p_max[cx] = p_hi;
+                rho_min[cx] = r_lo;
+                rho_max[cx] = r_hi;
             }
-            if p_lo > p_hi {
-                // No gas space at all in this chunk.
-                (p_lo, p_hi, r_lo, r_hi) = (0.0, 0.0, 0.0, 0.0);
-            }
-            s.p_min[c] = p_lo;
-            s.p_max[c] = p_hi;
-            s.rho_min[c] = r_lo;
-            s.rho_max[c] = r_hi;
-        }
-    }
+        });
 }
 
 pub fn solve(world: &mut World) {

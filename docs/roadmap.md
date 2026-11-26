@@ -11,7 +11,7 @@ Last updated 2026-11-26.
 | 3 | Gas pressure done properly; liquid pressure at depth | Gas pressure done 2026-11-26, at a performance cost (see below). Liquid pressure not started. |
 | 4 | Walls and digging; unsupported walls collapsing | Not started |
 | 5 | Compounds, reactions, dissolving | Not started |
-| 6 | Multithreading (checkerboard chunks); larger or streaming worlds | Not started |
+| 6 | Multithreading; larger or streaming worlds | First stage done 2026-11-26 with little gain; see "Multithreading, first stage" |
 
 The user chose to do gas pressure (step 3) before phase changes (step 2).
 
@@ -101,6 +101,28 @@ What is left in that scene, per step: gas 10.6 ms (pressure relaxation 4.4, movi
 Three further changes were tried on the gas pass and gained nothing measurable in this scene: keeping open-run lengths until the flags change (kept, it is sound), confining repeated local smoothing to a box around the pairs that moved a lot (kept), and not re-triggering relaxation while chunk pressure sums are unchanged (removed: no gain, and it could miss two compensating changes).
 
 What would help next, cheapest first: multithreading; a tighter inner loop for the face transfers and the adjacent-pair pass; smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk).
+
+### Multithreading, first stage (2026-11-26)
+
+Uses rayon. Parallel over rows of chunks ("bands"): derive, heat, the gas chunk summaries, and the gas face transfers. Still serial: buoyancy, the pressure relaxation, powders, liquids.
+
+| Cave scene, after 1 min | Single-threaded | 8 threads |
+|---|---|---|
+| 640×384 | 6.5 ms | 7.5 ms |
+| 1024×512 | 17.5 ms | 15.4 ms |
+
+By thread count at 1024×512 (`examples/threads.rs`, same session, single-threaded build 18.8 ms): 1 thread 20.6 ms, 2 threads 18.0, 4 threads 17.6, 8 threads 16.7.
+
+Findings:
+
+- **The passes do not scale with cores.** Derive goes 2.07 to 1.19 ms and heat 4.24 to 2.07 ms from 1 to 8 threads; gas barely moves (12.3 to 10.8 ms) even though its face transfers, about half of it, are parallel.
+- **Most likely cause: memory, not arithmetic.** Each pass streams over several whole-world arrays (about 40 MB of derived and scratch data at 1024×512, against 8 MB of cache), and there are around eight such sweeps per step. Cores share one memory bus. This also explains why three earlier attempts to trim arithmetic in the gas pass gained nothing. Not yet proven with a hardware counter.
+- **The smaller world got slower**, because it fits in cache better, so thread overhead and the heat pass's doubled arithmetic (each face is now evaluated from both sides so cells can be written independently) are not paid back.
+- **The step must run on a worker thread** (`rayon::scope` in `World::step`). Run from the caller's thread, every parallel section put that thread to sleep, and the serial passes after it ran at half speed on this laptop.
+
+What this points to next: keep a chunk's data in cache while doing all the gas work on it (process chunk by chunk through summaries, relaxation and transfers, instead of pass by pass over the world), and shrink what is streamed (pack the derived values per cell, drop arrays that can be recomputed). Parallelising the remaining serial passes should come after that, since it would hit the same wall.
+
+The user chose to keep this stage (committed 2026-11-26) and continue with the memory work.
 
 Superseded list from before that work: make solid cells nearly free inside awake chunks (skip derive for cells that did not change; skip rows or runs of rock in the gas passes); smaller chunks, 32×32 (needs the pressure pass reworked, which assumes pairs of 64 fit in a chunk); multithreading.
 

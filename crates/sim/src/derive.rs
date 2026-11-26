@@ -9,6 +9,7 @@
 use crate::cell::{Cell, Form};
 use crate::substance::Substances;
 use crate::world::World;
+use rayon::prelude::*;
 use crate::{CELL_M3, CHUNK, R_GAS, SLOTS};
 
 /// Gas volume is floored at this when computing pressure, so a trace of gas
@@ -102,39 +103,97 @@ struct Values {
 pub fn run(world: &mut World) {
     let step = world.step_count;
     let World { cells, chunks, derived: d, subs, .. } = world;
-    let w = chunks.w;
-    for cy in 0..chunks.ch {
-        for cx in 0..chunks.cw {
-            let c = cy * chunks.cw + cx;
-            if !chunks.active[c] {
+    let (w, cw) = (chunks.w, chunks.cw);
+    let cells: &[Cell] = cells;
+    let active: &[bool] = &chunks.active;
+    let subs: &Substances = subs;
+    // One task per row of chunks. Each task only writes its own rows.
+    let band = w * CHUNK;
+    let mut bands = Vec::with_capacity(chunks.ch);
+    {
+        let mut temp = d.temp.chunks_mut(band);
+        let mut cond = d.cond.chunks_mut(band);
+        let mut heat_cap = d.heat_cap.chunks_mut(band);
+        let mut pressure = d.pressure.chunks_mut(band);
+        let mut gas_vol = d.gas_vol.chunks_mut(band);
+        let mut gas_rho = d.gas_rho.chunks_mut(band);
+        let mut gas_pv = d.gas_pv.chunks_mut(band);
+        let mut fill = d.fill.chunks_mut(band);
+        let mut flags = d.flags.chunks_mut(band);
+        let mut stale = chunks.stale.chunks_mut(band);
+        let mut version = d.flags_version.chunks_mut(cw);
+        for _ in 0..chunks.ch {
+            bands.push(Band {
+                temp: temp.next().expect("band"),
+                cond: cond.next().expect("band"),
+                heat_cap: heat_cap.next().expect("band"),
+                pressure: pressure.next().expect("band"),
+                gas_vol: gas_vol.next().expect("band"),
+                gas_rho: gas_rho.next().expect("band"),
+                gas_pv: gas_pv.next().expect("band"),
+                fill: fill.next().expect("band"),
+                flags: flags.next().expect("band"),
+                stale: stale.next().expect("band"),
+                version: version.next().expect("band"),
+            });
+        }
+    }
+    bands.par_iter_mut().enumerate().for_each(|(cy, b)| {
+        let base = cy * band;
+        for cx in 0..cw {
+            let c = cy * cw + cx;
+            if !active[c] {
                 continue;
             }
             let everything = (step + c as u64) % REFRESH_EVERY == 0;
             let mut flags_changed = false;
-            for y in cy * CHUNK..(cy + 1) * CHUNK {
-                let row = y * w + cx * CHUNK;
+            for ly in 0..CHUNK {
+                let row = ly * w + cx * CHUNK;
                 // Look at eight marks at a time; unmarked stretches are the
                 // common case.
                 for group in (row..row + CHUNK).step_by(8) {
-                    let marks: [u8; 8] = chunks.stale[group..group + 8].try_into().expect("eight cells");
+                    let marks: [u8; 8] = b.stale[group..group + 8].try_into().expect("eight cells");
                     if !everything && u64::from_ne_bytes(marks) == 0 {
                         continue;
                     }
-                    for i in group..group + 8 {
-                        if everything || chunks.stale[i] != 0 {
-                            chunks.stale[i] = 0;
-                            let v = compute(&cells[i], subs);
-                            flags_changed |= v.flags != d.flags[i];
-                            store(d, i, v);
+                    for k in group..group + 8 {
+                        if everything || b.stale[k] != 0 {
+                            b.stale[k] = 0;
+                            let v = compute(&cells[base + k], subs);
+                            flags_changed |= v.flags != b.flags[k];
+                            b.temp[k] = v.temp;
+                            b.cond[k] = v.cond;
+                            b.heat_cap[k] = v.heat_cap;
+                            b.pressure[k] = v.pressure;
+                            b.gas_vol[k] = v.gas_vol;
+                            b.gas_rho[k] = v.gas_rho;
+                            b.gas_pv[k] = v.gas_pv;
+                            b.fill[k] = v.fill;
+                            b.flags[k] = v.flags;
                         }
                     }
                 }
             }
             if flags_changed {
-                d.flags_version[c] += 1;
+                b.version[cx] += 1;
             }
         }
-    }
+    });
+}
+
+/// The derived arrays for one row of chunks.
+struct Band<'a> {
+    temp: &'a mut [f32],
+    cond: &'a mut [f32],
+    heat_cap: &'a mut [f32],
+    pressure: &'a mut [f32],
+    gas_vol: &'a mut [f32],
+    gas_rho: &'a mut [f32],
+    gas_pv: &'a mut [f32],
+    fill: &'a mut [f32],
+    flags: &'a mut [u8],
+    stale: &'a mut [u8],
+    version: &'a mut [u64],
 }
 
 /// Recompute every cell of every active chunk and panic if a kept value
@@ -173,19 +232,6 @@ pub fn verify(world: &World) {
             }
         }
     }
-}
-
-#[inline(always)]
-fn store(d: &mut Derived, i: usize, v: Values) {
-    d.temp[i] = v.temp;
-    d.cond[i] = v.cond;
-    d.heat_cap[i] = v.heat_cap;
-    d.pressure[i] = v.pressure;
-    d.gas_vol[i] = v.gas_vol;
-    d.gas_rho[i] = v.gas_rho;
-    d.gas_pv[i] = v.gas_pv;
-    d.fill[i] = v.fill;
-    d.flags[i] = v.flags;
 }
 
 #[inline(always)]
